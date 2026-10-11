@@ -477,6 +477,76 @@ def _rgb256(i):
     return (lv[i // 36], lv[(i // 6) % 6], lv[i % 6])
 COLOR256 = {i: _rgb256(i) for i in range(16, 256)}
 
+# ---- palette intelligence: contrast-safe colors, an accent that matches the wallpaper, a faint tint of it on the ground
+def _rgb(h): return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+def _hex(c): return "#%02x%02x%02x" % tuple(max(0, min(255, round(v))) for v in c)
+def _lum(c):
+    def f(v): v /= 255; return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = c; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+def _contrast(a, b):
+    la, lb = _lum(a), _lum(b); return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+def _sat(c): mx, mn = max(c) / 255, min(c) / 255; return 0 if mx == 0 else (mx - mn) / mx
+def _mixh(a, b, k): return _hex([x + (y - x) * k for x, y in zip(_rgb(a), _rgb(b))])
+def readable(c, bg, fg, want):
+    """Pull color c toward the foreground until it reads on bg with contrast `want` (4.5 = normal text). Keeps its hue when it already does."""
+    for k in [i / 20 for i in range(21)]:
+        cand = _mixh(c, fg, k)
+        if _contrast(_rgb(cand), _rgb(bg)) >= want: return cand
+    return fg
+
+def wallpaper_pixels(n=24):
+    """The current wallpaper shrunk to n x n, as RGB tuples ([] when it cannot be read: everything then falls back to the theme alone)."""
+    path = os.path.expanduser("~/.local/state/omarchy/current/background")
+    try:
+        from PIL import Image
+        return list(Image.open(path).convert("RGB").resize((n, n)).getdata())
+    except Exception: pass
+    try:
+        out = subprocess.run(["magick", path + "[0]", "-resize", f"{n}x{n}!", "-depth", "8", "txt:-"], capture_output=True, timeout=4).stdout.decode()
+        return [_rgb(m) for m in re.findall(r"#[0-9A-Fa-f]{6}", out)]
+    except Exception: return []
+
+def refine(t):
+    """t: theme dict of '#rrggbb'. Makes every text color readable on its ground (light themes included), picks the accent and the
+    workspace order by how much of the wallpaper each palette color covers, and tints the ground a few % with the wallpaper's dominant color."""
+    bg, fg = t["background"], t["foreground"]
+    if _contrast(_rgb(fg), _rgb(bg)) < 7: fg = t["foreground"] = readable(fg, bg, "#ffffff" if _lum(_rgb(bg)) < 0.4 else "#000000", 7)
+    px = wallpaper_pixels()
+    vivid = [c for c in px if _sat(c) > 0.2 and 0.04 < _lum(c) < 0.9]
+    status = ("red", "green", "yellow", "bright_red", "bright_green", "bright_yellow")
+    names = ["accent", "orange", "blue", "cyan", "magenta", "purple", "bright_blue", "bright_cyan", "bright_magenta"] + list(status)
+    pal = []                                                               # (name, hex) without repeated colors
+    for n in names:
+        if n in t and t[n].lower() not in [h for _, h in pal]: pal.append((n, t[n].lower()))
+    share = {n: 0.0 for n, _ in pal}
+    if len(vivid) >= len(px) * 0.08 and pal:                               # each vivid pixel votes for the palette color closest to it
+        for c in vivid:
+            n = min(pal, key=lambda nh: sum((a - b) ** 2 for a, b in zip(c, _rgb(nh[1]))))[0]
+            share[n] += 1 / len(vivid)
+    own = [n for n, _ in pal if n not in status]
+    if share and any(share.values()) and own:
+        lively = [n for n in own if _sat(_rgb(t[n])) >= 0.35] or own                  # an accent has to be a color, not a gray
+        acc = max(lively, key=lambda n: share[n] * (1.5 if n == "accent" else 1) * (0.5 + _sat(_rgb(t[n]))))        # the theme's own accent gets a head start, not a veto
+        t["accent"] = t[acc]
+    order = sorted(pal, key=lambda nh: (nh[0] in status, -share[nh[0]]))       # theme colors by wallpaper coverage first; red/green/yellow keep their meaning, so they come last
+    ws = [h for _, h in order][:9]
+    ws += [h for _, h in pal if h not in ws][: 9 - len(ws)]
+    for i in range(9): t[f"ws{i}"] = (ws + [t["accent"]] * 9)[i]
+    if os.environ.get("DEATHCORRIDOR_TINT", "1") != "0" and len(vivid) >= 8:       # the ground takes ~7% of the wallpaper's dominant color
+        dom = _hex([sum(c[i] for c in vivid) / len(vivid) for i in range(3)])
+        t["background"] = bg = _mixh(bg, dom, 0.07)
+        t["selection"] = _mixh(bg, fg, 0.14)
+    for n in ("red", "green", "yellow", "blue", "magenta", "cyan", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan"):
+        if n in t: t[n] = readable(t[n], bg, fg, 4.5)
+    t["accent"] = readable(t["accent"], bg, fg, 3.0)
+    for i in range(9): t[f"ws{i}"] = readable(t[f"ws{i}"], bg, fg, 3.0)
+    t["muted"] = readable(_mixh(bg, fg, 0.5), bg, fg, 4.5)
+    t["track"] = _mixh(bg, fg, 0.16)                                         # empty part of the bars: faint, visible on dark and on light grounds
+    gr = max((t[n] for n in ("bright_green", "green") if n in t), key=lambda h: _sat(_rgb(h)), default=fg)
+    if _sat(_rgb(gr)) < 0.5: gr = _mixh(gr, "#2fe38a" if _lum(_rgb(bg)) < 0.4 else "#0a8f4a", 0.5)                      # totals stay a clear, lively green even on muted themes
+    t["totals"] = readable(gr, bg, fg, 4.5)
+    return t
+
 def theme():
     """Active Omarchy theme palette -> {name: 256 index}. Uses colors.toml; missing keys are derived from
     color0..15 (ANSI) or alacritty.toml. {} if nothing readable (the script falls back to its own colors)."""
@@ -505,6 +575,7 @@ def theme():
         t.setdefault(name, t.get(f"color{n}", fg))
         t.setdefault(f"bright_{name}", t.get(f"color{n + 8}", t[name]))
     t.setdefault("accent", t["blue"])
+    t = refine(t)
     return {k: hex256(v) for k, v in t.items() if re.fullmatch(r"#[0-9a-fA-F]{6}", v)}
 
 # ---------------------------------------------------------------- UI
@@ -524,15 +595,20 @@ def main(scr):
     ACCENT = T.get("accent", 208) if curses.COLORS >= 256 else 3
     cols = [T.get("green", 77), T.get("yellow", 221), T.get("red", 203), T.get("cyan", 80), T.get("muted", 244), T.get("foreground", 252)] if curses.COLORS >= 256 else [2, 3, 1, 6, 7, 7]
     # one color per workspace from the theme (1..9 fixed; named/special ones are stable by hash)
-    WS_PALETTE = [T.get(k, d) for k, d in (("accent", 208), ("cyan", 80), ("green", 77), ("blue", 110), ("magenta", 175),
-                                           ("yellow", 221), ("red", 203), ("bright_cyan", 116), ("bright_magenta", 182))] if curses.COLORS >= 256 else [3, 6, 2, 4, 5, 3, 1, 6, 5]
+    WS_PALETTE = [T.get(k, d) for k, d in (("ws0", 208), ("ws1", 80), ("ws2", 77), ("ws3", 110), ("ws4", 175),
+                                           ("ws5", 221), ("ws6", 203), ("ws7", 116), ("ws8", 182))] if curses.COLORS >= 256 else [3, 6, 2, 4, 5, 3, 1, 6, 5]
     def ws_color(x):
         wid = x["wid"]
         return WS_PALETTE[(wid - 1) % 9] if wid > 0 else WS_PALETTE[zlib.crc32(x["ws"].encode()) % 9]
     hdr = {}
-    def hdr_pair(c):                              # dark text on a solid color
+    FGC = T.get("foreground", 252) if curses.COLORS >= 256 else 7
+    def hdr_pair(c):                              # text on a solid color: the ground color or the foreground, whichever reads better (light themes too)
         if c not in hdr:
-            hdr[c] = 120 + len(hdr); curses.init_pair(hdr[c], BG, c)
+            txt = BG
+            if curses.COLORS >= 256 and all(i in COLOR256 for i in (c, BG, FGC)):
+                cc = _rgb(_hex(COLOR256[c]))
+                txt = BG if _contrast(cc, _rgb(_hex(COLOR256[BG]))) >= _contrast(cc, _rgb(_hex(COLOR256[FGC]))) else FGC
+            hdr[c] = 120 + len(hdr); curses.init_pair(hdr[c], txt, c)
         return curses.color_pair(hdr[c])
     for i, c in enumerate(cols):
         curses.init_pair(i + 1, c, BG)
@@ -804,10 +880,10 @@ def main(scr):
         # tab bar: brand band, tabs; totals on the right always win, so the left side shrinks to fit
         cpu_t, used, total = sums
         with lock: gtot = gpu_tot[0]
-        TOT = 48 if curses.COLORS >= 256 else cols[0]          # totals get their own green so they read as one group, apart from the per-row colors
+        TOT = T.get("totals", 48) if curses.COLORS >= 256 else cols[0]          # totals get their own green so they read as one group, apart from the per-row colors
         MUTED = P(5)
         def tone(frac, a, b): return (P(3) if frac >= b else P(2) if frac >= a else fg_pair(TOT)) | curses.A_BOLD     # green normally, yellow / red when high
-        TRACK = 238 if curses.COLORS >= 256 else cols[4]
+        TRACK = T.get("track", 238) if curses.COLORS >= 256 else cols[4]
         def bar(frac, n):                                    # solid cells: filled part in the tone color, empty part on a visible gray track
             k = max(0, min(n, int(round(frac * n))))
             c = cols[2] if frac >= 0.9 else cols[1] if frac >= 0.75 else TOT
