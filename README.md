@@ -21,6 +21,12 @@ It is a terminal app (floating window) with three places:
 
 ![JAIL following a program](docs/jail.png)
 
+### It follows your theme
+
+The same screen on four Omarchy themes (Starsend, Tokyo Night, Gruvbox, Osaka Jade). The colors come from the active theme; nothing is hard-coded to one look.
+
+![Four Omarchy themes](docs/themes.jpg)
+
 ## Install
 
 ```
