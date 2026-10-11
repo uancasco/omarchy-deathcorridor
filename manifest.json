@@ -4,7 +4,7 @@
   "name": "Deathcorridor task manager",
   "version": "1.0.0",
   "author": "uancasco",
-  "description": "A Ctrl+Alt+Del for Omarchy: apps, processes, and a JAIL where an AI helps fix hung or crashing programs",
+  "description": "Task manager for Omarchy: see apps and processes, end hung ones, and let an AI fix crashing programs. Ctrl+Alt+Del for Linux.",
   "kinds": [
     "bar-widget"
   ],
