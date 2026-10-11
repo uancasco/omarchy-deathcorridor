@@ -15,6 +15,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))          # find deathcorridor_report.py next to this script, however it is launched
 import deathcorridor_report as RP
 import deathcorridor_watch as WT
+import deathcorridor_private as PV
+PV.tighten(RP.STATE_DIR); PV.tighten(os.path.dirname(RP.CONFIG))      # anything stored by an older version gets owner-only permissions
 
 RATE, CHUNK_MS = 8000, 40
 level_by_bin, lock, seen = {}, threading.Lock(), set()   # level_by_bin[binary] = (peak 0..1, timestamp)
@@ -413,8 +415,7 @@ def my_lineage():
 
 def log_kill(msg):
     try:
-        d = os.path.expanduser("~/.local/state/deathcorridor"); os.makedirs(d, exist_ok=True)
-        with open(d + "/actions.log", "a") as f: f.write(time.strftime("%F %T ") + msg + "\n")
+        PV.append(os.path.join(RP.STATE_DIR, "actions.log"), time.strftime("%F %T ") + msg + "\n")
     except OSError: pass
 
 def kill_pids(pids, force=True):
@@ -1254,8 +1255,7 @@ try:
 except BaseException:
     import traceback
     try:
-        d = os.path.expanduser("~/.local/state/deathcorridor"); os.makedirs(d, exist_ok=True)
-        with open(d + "/crash.log", "a") as f: f.write(time.strftime("%F %T ") + traceback.format_exc() + "\n")
+        PV.append(os.path.join(RP.STATE_DIR, "crash.log"), time.strftime("%F %T ") + traceback.format_exc() + "\n")
     except OSError: pass
     traceback.print_exc()
 finally:

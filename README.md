@@ -77,7 +77,7 @@ On first entering JAIL it asks which AI to use (only if several are installed): 
 
 - Reads: `/proc`, `ps`, `hyprctl`, `coredumpctl`, `journalctl`, `pacman -Q`, `nvidia-smi` (if present), `pactl`/`parec` (audio meter).
 - Sends nothing anywhere by itself. A case file only leaves your machine if you choose an AI that is remote.
-- Writes only under `~/.local/state/deathcorridor/` (reports, `watched.json`, `watch/`, `actions.log`, `crash.log`) and `~/.config/deathcorridor/ai.conf`.
+- Writes only under `~/.local/state/deathcorridor/` (reports, `watched.json`, `watch/`, `actions.log`, `crash.log`) and `~/.config/deathcorridor/ai.conf`. Those folders are created owner-only (`0700`, files `0600`) whatever your umask is, and older files are tightened on start, because they hold paths and the history of programs you follow.
 - It can end processes of your user (SIGTERM, then SIGKILL). It never touches itself or the terminal that hosts it.
 
 Remove: `omarchy plugin remove`, then optionally delete the two folders above.

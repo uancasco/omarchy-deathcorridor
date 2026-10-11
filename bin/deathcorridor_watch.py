@@ -8,6 +8,7 @@ Status of a flagged program:
   resolved   it ran VERIFY_S seconds, healthy, after the fix was sent
 """
 import json, os, time
+import deathcorridor_private as PV
 
 STATE_DIR = os.path.expanduser("~/.local/state/deathcorridor")
 FILE = os.path.join(STATE_DIR, "watched.json")
@@ -40,17 +41,13 @@ class Watch:
 
     # ------------------------------------------------------------ persistence
     def _save(self):
-        os.makedirs(STATE_DIR, exist_ok=True)
         keep = {e: {k: v for k, v in w.items() if k not in ("samples", "pids")} for e, w in self.d.items()}
-        tmp = FILE + ".tmp"
-        with open(tmp, "w") as f: json.dump(keep, f)
-        os.replace(tmp, FILE)
+        PV.write(FILE, json.dumps(keep))
 
     def _log(self, exe, kind, text):
         w = self.d[exe]
-        os.makedirs(LOG_DIR, exist_ok=True)
         ev = dict(ts=time.time(), kind=kind, text=text)
-        with open(os.path.join(LOG_DIR, _slug(exe) + ".jsonl"), "a") as f: f.write(json.dumps(ev) + "\n")
+        PV.append(os.path.join(LOG_DIR, _slug(exe) + ".jsonl"), json.dumps(ev) + "\n")
         if kind in ("crashed", "stuck", "busy", "exited", "memory", "back"): w["incident"] = dict(kind=kind, text=text, ts=ev["ts"])
         return ev
 

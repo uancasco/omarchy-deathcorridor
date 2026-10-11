@@ -4,6 +4,7 @@ Nothing here changes the system. It reads what Linux already keeps (coredumpctl,
 writes one markdown "case file" with machine-identifying details redacted, ready to paste to an AI or open in `claude`.
 """
 import datetime, getpass, json, os, platform, re, shutil, signal, socket, subprocess, time
+import deathcorridor_private as PV
 
 HOME, USER, HOST = os.path.expanduser("~"), getpass.getuser(), socket.gethostname()
 STATE_DIR = os.path.expanduser("~/.local/state/deathcorridor")
@@ -59,8 +60,7 @@ def load_dismissed():
 def dismiss(exe, ts):
     """Hide a crash group until it crashes again (a newer crash than `ts` brings it back)."""
     d = load_dismissed(); d[exe] = ts
-    os.makedirs(STATE_DIR, exist_ok=True)
-    json.dump(d, open(DISMISS_FILE, "w"))
+    PV.write(DISMISS_FILE, json.dumps(d))
 
 
 def crash_groups(days=30):
@@ -404,12 +404,11 @@ def read_config():
 def ensure_config():
     if not os.path.exists(CONFIG):
         try:
-            os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-            open(CONFIG, "w").write(CONFIG_TEMPLATE)
+            PV.write(CONFIG, CONFIG_TEMPLATE)
         except OSError: pass
 
 
-LABELS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "opencode": "OpenCode", "local": "Local model (jaime)", "custom": "Custom command"}
+LABELS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "opencode": "OpenCode", "local": "Local model (Jaime)", "custom": "Custom command"}
 
 
 def installed():
@@ -429,8 +428,7 @@ def set_ai(tool):
     """Remember the choice (keeps a custom `command` line if the user wrote one)."""
     cmd = read_config().get("command")
     try:
-        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-        open(CONFIG, "w").write(CONFIG_TEMPLATE.replace("\nai = auto\n", f"\nai = {tool}\n") + (f"command = {cmd}\n" if cmd else ""))
+        PV.write(CONFIG, CONFIG_TEMPLATE.replace("\nai = auto\n", f"\nai = {tool}\n") + (f"command = {cmd}\n" if cmd else ""))
     except OSError: pass
 
 
@@ -448,8 +446,6 @@ def pick_ai():
 
 
 def save(name, text):
-    os.makedirs(REPORT_DIR, exist_ok=True)
     path = os.path.join(REPORT_DIR, re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:40] + "-" + time.strftime("%Y%m%d-%H%M%S") + ".md")
-    with open(path, "w") as f: f.write(text)
-    os.chmod(path, 0o600)
+    PV.write(path, text)
     return path
