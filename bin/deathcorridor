@@ -534,8 +534,8 @@ def refine(t):
     for i in range(9): t[f"ws{i}"] = (ws + [t["accent"]] * 9)[i]
     if os.environ.get("DEATHCORRIDOR_TINT", "1") != "0" and len(vivid) >= 8:       # the ground takes ~7% of the wallpaper's dominant color
         dom = _hex([sum(c[i] for c in vivid) / len(vivid) for i in range(3)])
-        t["background"] = bg = _mixh(bg, dom, 0.07)
-        t["selection"] = _mixh(bg, fg, 0.14)
+        t["background"] = bg = _mixh(bg, dom, 0.13)
+        t["selection"] = _mixh(bg, t["accent"], 0.22)
     for n in ("red", "green", "yellow", "blue", "magenta", "cyan", "bright_red", "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan"):
         if n in t: t[n] = readable(t[n], bg, fg, 4.5)
     t["accent"] = readable(t["accent"], bg, fg, 3.0)

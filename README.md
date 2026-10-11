@@ -23,11 +23,11 @@ It is a terminal app (floating window) with three places:
 
 ### It follows your theme
 
-Six Omarchy themes, dark and light, same screen. The colors are not hard-coded to one look:
+Six Omarchy themes, dark and light, same screen, with apps open on five workspaces. The colors are not hard-coded to one look:
 
 - every color is checked for contrast against the theme's background, so light themes stay readable;
 - the accent and the workspace colors are picked from the theme's palette by how much of your **wallpaper** each one covers;
-- the background takes a faint tint (about 7%) of the wallpaper's dominant color. Set `DEATHCORRIDOR_TINT=0` to turn that off.
+- the background takes a faint tint (about 13%) of the wallpaper's dominant color. Set `DEATHCORRIDOR_TINT=0` to turn that off.
 
 (Reading the wallpaper needs Pillow or ImageMagick; without them it falls back to the theme alone.)
 
