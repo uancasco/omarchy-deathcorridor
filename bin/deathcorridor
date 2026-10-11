@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))          # find 
 import deathcorridor_report as RP
 import deathcorridor_watch as WT
 import deathcorridor_private as PV
+import deathcorridor_keys as KY
 PV.tighten(RP.STATE_DIR); PV.tighten(os.path.dirname(RP.CONFIG))      # anything stored by an older version gets owner-only permissions
 
 RATE, CHUNK_MS = 8000, 40
@@ -672,6 +673,14 @@ def main(scr):
     last_main = 0
     cur_ai, ai_menu, ai_asked = RP.chosen(), None, False          # the AI that fixes things; menu shown once on entering JAIL if the user never chose
     W = WT.Watch()                                 # programs the user flagged to follow (key w)
+    kb_asked = False
+    kb = None                                      # shortcut chooser (modal): first run, or k
+    def open_kb():
+        nonlocal kb
+        ours = KY.our_combo()
+        items = ([("change", f"Change the shortcut (now {ours})"), ("remove", "Remove the shortcut"), ("close", "Close")] if ours else
+                 [("preset", f"{lab}") for _, lab in KY.PRESETS] + [("custom", "Another shortcut…"), ("later", "Not now (you can do this later with k)")])
+        kb = dict(mode="list", items=items, idx=0, text="", combo=None, note="")
     prob_rows = []
     wins, bgs, rows_all, procs_now = [], [], [], {}
     sums = (0, 0, 0)
@@ -875,7 +884,7 @@ def main(scr):
             last = time.time()
         h, w = scr.getmaxyx(); scr.erase()
         now = time.time()
-        hit_an, hit_dis, hit_menu, hit_ai = {}, {}, {}, None
+        hit_an, hit_dis, hit_menu, hit_ai, hit_kb = {}, {}, {}, None, {}
         hit_rows, hit_tabs, hit_heads, hit_kill, hit_group = {}, [], [], {}, None       # clickable regions, rebuilt every frame
 
         # tab bar: brand band, tabs; totals on the right always win, so the left side shrinks to fit
@@ -1139,7 +1148,31 @@ def main(scr):
                 if on_: put(y_, 1, " " * (w - 2), P(6, True))
                 put(y_, 1, " ▸ " if on_ else "   ", fg_pair(ACCENT, on_) | curses.A_BOLD)
                 put(y_, 4, lab_, P(6, on_) | (curses.A_BOLD if on_ else 0)); hit_menu[y_] = n_
+        if kb is None and not kb_asked:                                          # first run: offer a shortcut once (never when the user already has one)
+            kb_asked = True
+            if KY.should_ask(): open_kb()
+        if kb is not None:
+            for y_ in range(3, h - 1): put(y_, 1, " " * (w - 2), P(6))
+            if kb["mode"] == "list":
+                ours_ = KY.our_combo()
+                put(4, 4, "Open the task manager with a keyboard shortcut?" if not ours_ else "Keyboard shortcut", P(6) | curses.A_BOLD)
+                put(5, 4, ("Your shortcuts file is only changed when you pick one here; a backup is kept." if not ours_ else f"Current shortcut: {ours_}"), P(5))
+                for n_, (id_, lab_) in enumerate(kb["items"]):
+                    y_ = 7 + n_; on_ = n_ == kb["idx"]
+                    if on_: put(y_, 1, " " * (w - 2), P(6, True))
+                    put(y_, 1, " ▸ " if on_ else "   ", fg_pair(ACCENT, on_) | curses.A_BOLD)
+                    put(y_, 4, lab_, P(6, on_) | (curses.A_BOLD if on_ else 0)); hit_kb[y_] = n_
+                if not ours_: put(8 + len(kb["items"]), 4, "Ctrl + Alt + Delete replaces Omarchy's \"Close all windows\" shortcut.", P(5))
+            elif kb["mode"] == "text":
+                put(4, 4, "Type the shortcut, for example  SUPER + CTRL + T", P(6) | curses.A_BOLD)
+                put(5, 4, "Modifiers: SUPER, CTRL, ALT, SHIFT. Then one key (letter, number, F1-F12, DELETE, RETURN…).", P(5))
+                put(7, 4, "> " + kb["text"] + "█", P(6) | curses.A_BOLD)
+                if kb["note"]: put(9, 4, kb["note"], P(2))
+            else:
+                put(4, 4, f"{kb['combo']} is already used for: {kb['taken']}", P(2) | curses.A_BOLD)
+                put(5, 4, "Replace it with the task manager?  Enter = yes · Esc = back", P(6))
         if msg and now < msg_until: put(h - 1, 1, msg[: w - 2], P(2))
+        elif kb is not None: put(h - 1, 1, "↑↓ choose · Enter · Esc: back / later", P(5))
         elif view == 2 and ai_menu is not None: put(h - 1, 1, "↑↓ choose · Enter: use it · Esc: later", P(5))
         else:
             foot = ("pick a row · x end task · Enter go · c close · w follow · a fix it · Ctrl+F search · Tab: Processes · F2 Jail · Esc quit" if view == 0 else
@@ -1150,6 +1183,47 @@ def main(scr):
 
         k = scr.getch()
         if k == -1: continue
+        if kb is not None:                                                      # the shortcut chooser owns the keyboard while open
+            def kb_apply(combo):
+                nonlocal kb
+                try: say(KY.apply(combo), 8)
+                except OSError as e_: say(f"Could not write the shortcuts file: {e_}", 8)
+                kb = None
+            def kb_choose(combo):
+                if not combo: kb["note"] = "That is not a valid shortcut. Example: SUPER + CTRL + T"; return
+                taken_ = KY.conflict(combo)
+                if taken_: kb.update(mode="confirm", combo=combo, taken=taken_)
+                else: kb_apply(combo)
+            def kb_select(i_):
+                nonlocal kb
+                id_ = kb["items"][i_][0]
+                if id_ == "preset": kb_choose(KY.PRESETS[i_][0])
+                elif id_ == "custom": kb.update(mode="text", text="", note="")
+                elif id_ == "change": kb["items"] = [("preset", lab_) for _, lab_ in KY.PRESETS] + [("custom", "Another shortcut…")]; kb["idx"] = 0
+                elif id_ == "remove": say(KY.remove(), 8); kb = None
+                else:
+                    if id_ == "later": KY.mark_asked()
+                    kb = None
+            if k == curses.KEY_MOUSE:
+                try: _, mx, my, _, bs = curses.getmouse()
+                except curses.error: continue
+                if kb["mode"] == "list" and bs & curses.BUTTON1_PRESSED and my in hit_kb: kb["idx"] = hit_kb[my]; kb_select(hit_kb[my])
+            elif kb["mode"] == "list":
+                if k == curses.KEY_DOWN: kb["idx"] = min(len(kb["items"]) - 1, kb["idx"] + 1)
+                elif k == curses.KEY_UP: kb["idx"] = max(0, kb["idx"] - 1)
+                elif k in (10, 13, curses.KEY_ENTER): kb_select(kb["idx"])
+                elif k == 27:
+                    if not KY.our_combo(): KY.mark_asked()
+                    kb = None
+            elif kb["mode"] == "text":
+                if k in (10, 13, curses.KEY_ENTER): kb_choose(KY.parse_combo(kb["text"]))
+                elif k == 27: open_kb()
+                elif k in (curses.KEY_BACKSPACE, 127, 8): kb["text"] = kb["text"][:-1]
+                elif 32 <= k < 127: kb["text"] += chr(k); kb["note"] = ""
+            else:
+                if k in (10, 13, curses.KEY_ENTER): kb_apply(kb["combo"])
+                elif k == 27: kb.update(mode="list")
+            continue
         if ai_menu is not None and view == 2:                                   # the AI question owns the keyboard until answered
             pick_ = None
             if k == curses.KEY_MOUSE:
@@ -1207,6 +1281,8 @@ def main(scr):
                 keys_ = keys
                 if keys_ and sel[view] not in keys_: sel[view] = keys_[0]
                 picked[view] = bool(keys_); continue
+        if k == ord("k") and not typing_mode:
+            open_kb(); continue
         if k == ord("w") and picked[view] and not typing_mode:
             toggle_watch(); continue
         if k == ord("a") and picked[view] and not typing_mode:

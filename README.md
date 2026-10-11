@@ -41,7 +41,9 @@ omarchy plugin add https://github.com/uancasco/omarchy-deathcorridor --enable
 
 This adds a task-manager button to the bar. The app itself lives in `bin/`; the button runs `bin/deathcorridor-open`, which opens it or raises it if it is already open (floating, pinned, on top).
 
-Bind it to a key in `~/.config/hypr/bindings.lua` (Omarchy's Lua config):
+**Keyboard shortcut:** the first time you open it, deathcorridor asks if you want a shortcut (`Ctrl + Alt + Delete`, `Super + Ctrl + M`, or one you type). If you accept, it adds one clearly marked block to `~/.config/hypr/bindings.lua`, after saving a backup in `~/.local/state/deathcorridor/backups/`, and warns you before replacing a shortcut that already does something (for example Omarchy's "Close all windows" on `Ctrl + Alt + Delete`). Nothing is changed unless you pick one. Press `k` inside the app to change or remove it later; removing it deletes only that block.
+
+If you prefer to do it by hand, add this to `bindings.lua`:
 
 ```lua
 o.bind("SUPER + CTRL + M", "Task manager", "~/.config/omarchy/plugins/io.github.uancasco.deathcorridor/bin/deathcorridor-open", { dont_inhibit = true })
@@ -64,6 +66,7 @@ o.window("^TUI.float$", { tag = "-default-opacity", opacity = "1 override 1 over
 | `x` / `Del` | end the picked task (asks twice for critical ones) |
 | `c` | close the picked window (Apps) |
 | `w` | follow / stop following the picked program |
+| `k` | set, change or remove the keyboard shortcut |
 | `a` / `Enter` in JAIL | Fix it: send the case to your AI |
 | `i` in JAIL | choose the AI |
 | `← →`, `Ctrl+R`, `Ctrl+G` | Processes: sort column, reverse, group by name |
@@ -77,7 +80,7 @@ On first entering JAIL it asks which AI to use (only if several are installed): 
 
 - Reads: `/proc`, `ps`, `hyprctl`, `coredumpctl`, `journalctl`, `pacman -Q`, `nvidia-smi` (if present), `pactl`/`parec` (audio meter).
 - Sends nothing anywhere by itself. A case file only leaves your machine if you choose an AI that is remote.
-- Writes only under `~/.local/state/deathcorridor/` (reports, `watched.json`, `watch/`, `actions.log`, `crash.log`) and `~/.config/deathcorridor/ai.conf`. Those folders are created owner-only (`0700`, files `0600`) whatever your umask is, and older files are tightened on start, because they hold paths and the history of programs you follow.
+- Writes only under `~/.local/state/deathcorridor/` (reports, `watched.json`, `watch/`, `actions.log`, `crash.log`) and `~/.config/deathcorridor/ai.conf`. The only file outside those is your `~/.config/hypr/bindings.lua`, and only if you choose a shortcut (one marked block, with a backup). Those folders are created owner-only (`0700`, files `0600`) whatever your umask is, and older files are tightened on start, because they hold paths and the history of programs you follow.
 - It can end processes of your user (SIGTERM, then SIGKILL). It never touches itself or the terminal that hosts it.
 
 Remove: `omarchy plugin remove`, then optionally delete the two folders above.
