@@ -138,9 +138,16 @@ def system_facts():
 
 
 def package_of(exe):
+    """'name version' of the package that owns exe: pacman (Arch), dpkg (Debian/Ubuntu) or rpm (Fedora/openSUSE). None if unknown."""
     if not (exe and os.path.exists(exe)): return None
     own = sh("pacman", "-Qo", "-q", exe).strip()
-    return sh("pacman", "-Q", own).strip() if own else ""
+    if own: return sh("pacman", "-Q", own).strip()
+    pkg = sh("dpkg", "-S", exe).partition(":")[0].strip()                                  # "coreutils: /usr/bin/sleep"
+    if pkg and " " not in pkg:
+        ver = sh("dpkg-query", "-W", "-f=${Version}", pkg).strip()
+        if ver: return f"{pkg} {ver}"
+    out = sh("rpm", "-qf", exe).strip().splitlines()                                       # "coreutils-9.3-1.fc39.x86_64"
+    return out[0] if out and "not owned" not in out[0] and " " not in out[0] else ""
 
 
 def cmdline(pid):

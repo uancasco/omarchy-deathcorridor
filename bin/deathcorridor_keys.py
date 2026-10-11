@@ -90,6 +90,7 @@ def mark_asked(): PV.write(STATE_FILE, json.dumps(dict(state(), asked=True)))
 
 
 def should_ask():
+    if not shutil.which("omarchy"): return False        # `o.bind` only exists in Omarchy's Hyprland config
     return not state().get("asked") and not our_block() and not user_has_own_binding() and os.path.exists(bindings_file())
 
 
@@ -115,7 +116,8 @@ def _write(text):
 
 def _reload():
     if not os.environ.get("DEATHCORRIDOR_BINDINGS"):
-        subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=8)
+        try: subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=8)
+        except (OSError, subprocess.SubprocessError): pass
 
 
 def apply(combo):

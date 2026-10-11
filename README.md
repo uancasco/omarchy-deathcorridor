@@ -55,6 +55,24 @@ Optional, so it reads over anything: in `hyprland.lua`
 o.window("^TUI.float$", { tag = "-default-opacity", opacity = "1 override 1 override 1 override", opaque = true })
 ```
 
+## Other distros and desktops
+
+The **bar button and the marketplace listing are Omarchy-only** (they are a Quickshell plugin). The app itself is one Python 3 script with no pip dependencies, so you can run it anywhere: `python3 bin/deathcorridor`.
+
+| | Omarchy (Hyprland) | Other Linux |
+|---|---|---|
+| Processes view, sorting, search, end task, follow (`w`) | yes | yes (Linux `/proc`) |
+| JAIL: hung apps, repeated crashes, AI fix | yes | yes with systemd (`coredumpctl`, `journalctl`) |
+| Apps view with windows and workspaces | yes | no: needs Hyprland (`hyprctl`); without it the app opens on Processes and Apps only lists background apps |
+| Audio meter per app | yes | yes with PipeWire/PulseAudio (`pactl`, `parec`) |
+| GPU / VRAM columns | NVIDIA (`nvidia-smi`) | NVIDIA only; AMD and Intel show blanks |
+| Theme colors and wallpaper accent | Omarchy theme | built-in colors (Python 3.11+ is also needed to read themes) |
+| Package and "recent updates" in the case file | pacman | package name via pacman, dpkg or rpm (untested outside Arch); update history is pacman-only |
+| Keyboard shortcut offer | yes | not offered (it edits Omarchy's `bindings.lua`) |
+| AI window | Omarchy's launcher | first terminal found, or the case is copied to the clipboard (`wl-copy`, `xclip`, `xsel`) |
+
+Tested on Omarchy only. Reports and patches for other setups are welcome.
+
 ## Keys
 
 | Key | Action |
@@ -87,7 +105,7 @@ Remove: `omarchy plugin remove`, then optionally delete the two folders above.
 
 ## Requirements
 
-Omarchy (Hyprland, Quickshell shell), Python 3 (standard library only), `jq`, `hyprctl`, `notify-send`, `wl-copy`. Optional: `nvidia-smi`, `pactl` + `parec`, `coredumpctl`.
+Omarchy (Hyprland, Quickshell shell) for the plugin, Python 3 (standard library only; 3.11+ for theme colors). Optional, each one only enables its part: `jq` and `hyprctl` (Apps view, opener), `notify-send`, `wl-copy`/`xclip`/`xsel`, `nvidia-smi`, `pactl` + `parec`, `coredumpctl`/`journalctl`, ImageMagick or Pillow (wallpaper accent).
 
 ## License
 

@@ -10,7 +10,7 @@ Keys (both views): Up/Down move · Tab switch view · Del end task
   Processes:  Left/Right sort column · Ctrl+R reverse · Ctrl+G group by name"""
 import os
 os.environ.setdefault("ESCDELAY", "15")   # Esc without delay (curses waits 1s by default)
-import curses, json, subprocess, struct, threading, time, math, zlib, signal, re, glob, configparser
+import curses, json, subprocess, struct, threading, time, math, zlib, signal, re, glob, configparser, shutil
 import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))          # find deathcorridor_report.py next to this script, however it is launched
 import deathcorridor_report as RP
@@ -25,7 +25,8 @@ ME = os.getuid()
 NCPU = os.cpu_count() or 1
 
 def sh(*a):
-    return subprocess.run(a, capture_output=True).stdout.decode("utf-8", "replace")
+    try: return subprocess.run(a, capture_output=True).stdout.decode("utf-8", "replace")
+    except OSError: return ""                    # a tool this machine does not have (nvidia-smi, hyprctl, pactl…): that part just stays empty
 
 # ---------------------------------------------------------------- audio meter
 
@@ -304,7 +305,7 @@ def unit_name(u):
 def collect_apps(procs, kids):
     """-> (windows, background apps). Background = a systemd app unit with running processes but no window."""
     try: clients = json.loads(sh("hyprctl", "-j", "clients"))
-    except Exception: return [], []
+    except Exception: clients = []                 # no Hyprland here: no window list, but apps (systemd units) still show as "background"
     wins, win_units, win_pids = [], set(), set()
     for c in clients:
         if not c.get("mapped"): continue
@@ -400,9 +401,29 @@ def system_totals(procs):
         if k in ("MemTotal", "MemAvailable"): mem[k] = int(v)
     return min(cpu, 100), mem.get("MemTotal", 0) - mem.get("MemAvailable", 0), mem.get("MemTotal", 0)
 
+def copy_text(text):
+    """Clipboard on Wayland (wl-copy) or X11 (xclip / xsel); False if the machine has none of them."""
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        try: subprocess.run(cmd, input=text.encode(), timeout=3, check=True); return True
+        except (OSError, subprocess.SubprocessError): continue
+    return False
+
+def launch_in_terminal(argv):
+    """Run argv in a new terminal window: Omarchy's launcher when there is one, otherwise the first terminal found. False if none."""
+    cands = [["omarchy-launch-tui"], ["xdg-terminal-exec"]] + ([[os.environ["TERMINAL"], "-e"]] if os.environ.get("TERMINAL") else []) + \
+            [[t, "-e"] for t in ("kitty", "alacritty", "foot", "ghostty", "wezterm", "konsole", "gnome-terminal", "xterm")]
+    for c in cands:
+        if shutil.which(c[0]):
+            subprocess.Popen(c + argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); return True
+    return False
+
+def notify(text):
+    try: subprocess.Popen(["notify-send", "deathcorridor", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError: pass
+
 def hypr_dispatch(expr):
     """Hyprland >= 0.55 with the Lua config: `hyprctl dispatch` takes a Lua dispatcher expression."""
-    out = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True).stdout.decode("utf-8", "replace")
+    out = sh("hyprctl", "dispatch", expr)
     return out.strip().startswith("ok")
 
 def my_lineage():
@@ -552,7 +573,8 @@ def refine(t):
 def theme():
     """Active Omarchy theme palette -> {name: 256 index}. Uses colors.toml; missing keys are derived from
     color0..15 (ANSI) or alacritty.toml. {} if nothing readable (the script falls back to its own colors)."""
-    import tomllib
+    try: import tomllib
+    except ImportError: return {}                                  # Python < 3.11: no theme reading, the built-in colors are used
     d = os.path.expanduser("~/.local/state/omarchy/current/theme/")
     def load(name):
         try:
@@ -591,7 +613,8 @@ def stat_x(w):
 
 def main(scr):
     curses.curs_set(0); curses.use_default_colors(); scr.timeout(60)
-    T = theme() if curses.COLORS >= 256 else {}
+    try: T = theme() if curses.COLORS >= 256 else {}
+    except Exception: T = {}                                       # no Omarchy theme (other distro), unreadable file…: built-in colors
     BG = T.get("background", 234) if curses.COLORS >= 256 else curses.COLOR_BLACK
     SEL = T.get("selection", 238) if curses.COLORS >= 256 else curses.COLOR_BLUE   # uniform selected-row background (no A_REVERSE)
     ACCENT = T.get("accent", 208) if curses.COLORS >= 256 else 3
@@ -669,7 +692,8 @@ def main(scr):
     threading.Thread(target=watch_stats, daemon=True).start()
     threading.Thread(target=watch_problems, daemon=True).start()
 
-    view = 0                                       # 0 apps · 1 processes · 2 jail (opened with F2 / click, not part of Tab)
+    view = 0 if shutil.which("hyprctl") else 1      # without Hyprland there is no window list: open on Processes
+    #                                              # 0 apps · 1 processes · 2 jail (opened with F2 / click, not part of Tab)
     last_main = 0
     cur_ai, ai_menu, ai_asked = RP.chosen(), None, False          # the AI that fixes things; menu shown once on entering JAIL if the user never chose
     W = WT.Watch()                                 # programs the user flagged to follow (key w)
@@ -820,12 +844,12 @@ def main(scr):
                 tool, script = RP.pick_ai()
                 text, n = RP.build_report(subj); RP.save(subj["name"], text)
                 if not script:                                              # no AI to open: hand the case over through the clipboard
-                    subprocess.run(["wl-copy"], input=(RP.prompt_for(None) + text).encode(), timeout=3)
+                    copy_text(RP.prompt_for(None) + text)
                     say(f"{tool.capitalize()}. The case is copied: paste it into any AI.", 10)
                     if wexe: W.mark_fix_sent(wexe)
                     return
                 pf = RP.save(subj["name"] + "-prompt", RP.prompt_for(tool) + text)
-                subprocess.Popen(["omarchy-launch-tui", "bash", "-lc", script, pf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                if not launch_in_terminal(["bash", "-lc", script, pf]): copy_text(RP.prompt_for(tool) + text); say("No terminal found to open the AI: the case is copied, paste it into your AI.", 10); return
                 say(f"Done: {tool} is looking into {subj['name']} in a new window.", 6)
                 if wexe: W.mark_fix_sent(wexe)
             except Exception as e: say(f"Could not open the AI: {e}", 8)
@@ -857,7 +881,7 @@ def main(scr):
             alert = max(cands, key=lambda c_: (c_[1][0] == "stuck", c_[1][1])) if cands else None
             with lock: crashes_ = list(crash_cache[0])
             for msg_ in W.update(procs_now, lambda p_: cp.get(p_, 0), health, crashes_):
-                say(msg_, 10); subprocess.Popen(["notify-send", "deathcorridor", msg_], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                say(msg_, 10); notify(msg_)
             prob_rows = []                                                  # Problems: not responding / working hard right now, then crash history
             seen_ = set()
             def live_row(key, name, pids, hl):

@@ -9,6 +9,15 @@ raise() {  # $1 = address: pinned (follows you across workspaces, drawn above no
   hyprctl dispatch "hl.dsp.focus({ window = \"$w\" })" >/dev/null
   hyprctl dispatch "hl.dsp.window.bring_to_top({ window = \"$w\" })" >/dev/null
 }
+# No Hyprland (another desktop): just open it in a terminal
+if ! command -v hyprctl >/dev/null 2>&1; then
+  for t in "${TERMINAL:-}" xdg-terminal-exec kitty alacritty foot ghostty wezterm konsole gnome-terminal xterm; do
+    [[ -n $t ]] && command -v "$t" >/dev/null 2>&1 || continue
+    [[ $t == xdg-terminal-exec ]] && exec "$t" "$here/deathcorridor"
+    exec "$t" -e "$here/deathcorridor"
+  done
+  echo "deathcorridor: no terminal found" >&2; exit 1
+fi
 addr=$(find_addr)
 if [[ -n $addr ]]; then
   raise "$addr"
