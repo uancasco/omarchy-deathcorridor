@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.uancasco.deathcorridor",
+  "name": "Deathcorridor task manager",
+  "version": "1.0.0",
+  "author": "uancasco",
+  "description": "A Ctrl+Alt+Del for Omarchy: apps, processes, and a JAIL where an AI helps fix hung or crashing programs",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Task manager",
+    "description": "Button that opens the deathcorridor task manager",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

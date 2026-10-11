@@ -1,0 +1,1187 @@
+#!/usr/bin/env python3
+"""deathcorridor: live task manager for Hyprland, three views (Tab switches).
+  Apps       open windows grouped by workspace (real audio meter per app) + apps living in the background
+  Processes  every process of yours, sortable by CPU / memory / GPU / name / PID, optionally grouped by name
+  JAIL       (F2) what needs fixing: an app not responding, or one that keeps crashing. Enter = the AI looks into it and fixes it (asking first)
+Keys (both views): Up/Down move · Tab switch view · Del end task
+  w           follow the picked program (◉): records what happens to it, shows in JAIL, checks the fix
+  Both:       Ctrl+F (or /) to search (Apps: name/title · Processes: name/PID) · Enter/arrows leave the search · Ctrl+U clear · Esc clears the search, then quits
+  Apps:       Enter go to window · c close window (SIGTERM for background apps) · x end task
+  Processes:  Left/Right sort column · Ctrl+R reverse · Ctrl+G group by name"""
+import os
+os.environ.setdefault("ESCDELAY", "15")   # Esc without delay (curses waits 1s by default)
+import curses, json, subprocess, struct, threading, time, math, zlib, signal, re, glob, configparser
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))          # find deathcorridor_report.py next to this script, however it is launched
+import deathcorridor_report as RP
+import deathcorridor_watch as WT
+
+RATE, CHUNK_MS = 8000, 40
+level_by_bin, lock, seen = {}, threading.Lock(), set()   # level_by_bin[binary] = (peak 0..1, timestamp)
+ME = os.getuid()
+NCPU = os.cpu_count() or 1
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True).stdout.decode("utf-8", "replace")
+
+# ---------------------------------------------------------------- audio meter
+
+def reader(idx, sink, binary):
+    size = RATE * 2 * CHUNK_MS // 1000
+    p = subprocess.Popen(["parec", f"--monitor-stream={idx}", "-d", sink + ".monitor", "--format=s16le",
+                          f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            d = p.stdout.read(size)
+            if len(d) < size: break
+            v = struct.unpack(f"<{len(d)//2}h", d)
+            peak = max(abs(x) for x in v) / 32768
+            with lock:
+                level_by_bin[binary] = (peak, time.time())
+    finally:
+        p.kill()
+        with lock: seen.discard(idx)
+
+def watch_audio():
+    while True:
+        try:
+            sinks = {s["index"]: s["name"] for s in json.loads(sh("pactl", "-f", "json", "list", "sinks") or "[]")}
+            for s in json.loads(sh("pactl", "-f", "json", "list", "sink-inputs") or "[]"):
+                if s.get("corked") or s["index"] in seen or s["sink"] not in sinks: continue
+                pr = s["properties"]
+                b = (pr.get("application.process.binary") or pr.get("application.name") or "").lower()
+                with lock: seen.add(s["index"])
+                threading.Thread(target=reader, args=(s["index"], sinks[s["sink"]], b), daemon=True).start()
+        except Exception:
+            pass
+        time.sleep(1)
+
+def mpris_titles():
+    """Titles of what is playing (MPRIS): Chrome shares one process across all its windows; this tells which one is playing."""
+    out = []
+    for n in sh("busctl", "--user", "list", "--no-legend").splitlines():
+        n = n.split()[0] if n.split() else ""
+        if not n.startswith("org.mpris.MediaPlayer2."): continue
+        a = ("--user", "--json=short", "get-property", n, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player")
+        try:
+            if json.loads(sh("busctl", *a, "PlaybackStatus"))["data"] != "Playing": continue
+            t = json.loads(sh("busctl", *a, "Metadata"))["data"].get("xesam:title", {}).get("data", "")
+            if t: out.append(t)
+        except Exception: pass
+    return out
+
+# ---------------------------------------------------------------- friendly names / icons
+
+TERMINALS = ("kitty", "alacritty", "foot", "ghostty", "wezterm", "org.omarchy.", "xterm", "com.mitchellh.ghostty", "org.codeberg.dnkl.foot")
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "nu", "kitten", "xdg-terminal-ex", "uwsm-app", "ps", "python3", "tmux:", "tmux", "ssh-agent"}
+KNOWN = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "gemini": "Gemini CLI", "nvim": "Neovim", "vim": "Vim",
+         "btop": "btop", "yazi": "Yazi", "lazygit": "lazygit", "htop": "htop", "mpv": "mpv", "cliamp": "cliamp", "ncdu": "ncdu"}
+WEBAPPS = {"web.whatsapp.com": "WhatsApp", "music.youtube.com": "YouTube Music", "youtube.com": "YouTube", "mail.google.com": "Gmail",
+           "calendar.google.com": "Google Calendar", "claude.ai": "Claude", "chatgpt.com": "ChatGPT", "app.slack.com": "Slack", "discord.com": "Discord"}
+INTERPRETERS = {"python", "python3", "node", "bash", "sh", "zsh", "java", "ruby", "perl", "electron"}
+PROTECTED = {"Hyprland", "systemd", "dbus-broker", "dbus-broker-lau", "uwsm", "wireplumber", "pipewire", "xdg-desktop-por", "login"}
+
+def term_program(pid, kids):
+    """First 'real' program under a terminal (skipping shells and helpers): claude, nvim, btop..."""
+    queue = [pid]
+    while queue:
+        nxt = []
+        for p in queue:
+            for cp, comm, args in kids.get(p, []):
+                if "<defunct>" in args: continue
+                txt = (comm + " " + args).lower()
+                for k, v in KNOWN.items():
+                    if comm.lower() == k or f"/{k} " in txt + " " or txt.startswith(k + " "): return v
+                if comm not in SHELLS and not comm.startswith("kitten"): return comm
+                nxt.append(cp)
+        queue = nxt
+    return None
+
+def friendly_name(cls, pid, kids):
+    c = cls.lower()
+    if c.startswith("chrome-"):
+        host = c[7:].split("__")[0].replace("www.", "")
+        return WEBAPPS.get(host, host) + " (web app)"
+    if c == "google-chrome": return "Google Chrome"
+    if any(c == t or c.startswith(t) for t in TERMINALS):
+        prog = term_program(pid, kids)
+        return f"Terminal › {prog}" if prog else "Terminal"
+    if c.startswith("org.") or "." in c: return c.split(".")[-1].replace("_", " ")
+    return cls[:1].upper() + cls[1:] if cls.islower() else cls
+
+ICONS = {"Google Chrome": "\U000F02AF", "WhatsApp": "\U000F05A3", "YouTube": "\U000F05C3", "YouTube Music": "\U000F075A", "Gmail": "\U000F02AB",
+         "Blender": "\U000F00AB", "Discord": "\U000F066F", "Slack": "\U000F04B1", "Claude": "\U000F06A9", "ChatGPT": "\U000F06A9",
+         "Claude Code": "\U000F06A9", "Codex": "\U000F06A9", "OpenCode": "\U000F06A9", "Gemini CLI": "\U000F06A9",
+         "Neovim": "", "mpv": "\U000F040A", "wl mirror": "\U000F0379"}
+COLORS = {"Google Chrome": 220, "WhatsApp": 41, "YouTube": 196, "YouTube Music": 196, "Gmail": 203, "Blender": 208, "Discord": 105,
+          "Slack": 133, "Claude": 173, "Claude Code": 173, "ChatGPT": 36, "Codex": 111, "OpenCode": 215, "Gemini CLI": 75,
+          "Neovim": 70, "mpv": 98, "wl mirror": 75}
+def icon_color(name):
+    base = name.split("›")[-1].strip().replace(" (web app)", "")
+    return COLORS.get(base, 250 if name.startswith("Terminal") else 245)
+
+G = dict(film="\U000F022F", cube="\U000F01A7", game="\U000F0297", note="\U000F0387", web="\U000F059F", folder="\U000F024B",
+         doc="\U000F0219", chat="\U000F0361", down="\U000F01DA", cog="\U000F0493", chart="\U000F012A", code="\U000F0174",
+         pencil="\U000F03EB", palette="\U000F03D8", vscode="\U000F0A1E", unity="\U000F06AF", unreal="\U000F09B1", steam="\U000F04D3",
+         spotify="\U000F04C7", docker="\U000F0868", tv="\U000F0502", rec="\U000F044A", cal="\U000F00ED", calc="\U000F00EC",
+         print="\U000F042A", disk="\U000F02CA", zip="\U000F05C4", app="\U000F08C6", search="\U000F0349", desk="\U000F07C0",
+         video="\U000F0567", check="\U000F05E0", book="\U000F082E", term="\U000F018D", robot="\U000F06A9", play="\U000F040A",
+         sheet="\U000F021B", slides="\U000F0227", mail="\U000F01EE", cloud="\U000F015F", shield="\U000F0499", printer3d="\U000F042B")
+# (regex over class/name, friendly name, glyph, 256 color)
+APPS = [
+  (r"resolve|davinci", "DaVinci Resolve", "film", 203), (r"^fusion", "Fusion", "film", 141), (r"houdini", "Houdini", "cube", 208),
+  (r"maya", "Maya", "cube", 38), (r"unrealeditor|unreal", "Unreal Engine", "unreal", 255), (r"^unity|unityhub", "Unity", "unity", 255),
+  (r"instamat", "InstaMAT", "cube", 75), (r"bambu", "Bambu Studio", "printer3d", 41), (r"^steam_app_\d+", "Game (Steam)", "game", 75),
+  (r"^steam", "Steam", "steam", 75), (r"obs", "OBS Studio", "rec", 255), (r"spotify", "Spotify", "spotify", 41), (r"deemix", "Deemix", "down", 213),
+  (r"deezer", "Deezer", "note", 213), (r"deadbeef", "DeaDBeeF", "note", 214), (r"cliamp", "cliamp", "note", 214), (r"kodi", "Kodi", "tv", 39),
+  (r"stremio", "Stremio", "tv", 99), (r"moonlight", "Moonlight", "desk", 75), (r"sunshine", "Sunshine", "desk", 220), (r"retroarch|retrodeck|emulationstation", "RetroArch / RetroDECK", "game", 41),
+  (r"signal", "Signal", "chat", 33), (r"discord", "Discord", "chat", 105), (r"slack", "Slack", "chat", 133), (r"zoom", "Zoom", "video", 33),
+  (r"qbittorrent", "qBittorrent", "down", 33), (r"obsidian", "Obsidian", "book", 135), (r"vscode|code-oss|^code$", "VS Code", "vscode", 33),
+  (r"lmstudio", "LM Studio", "robot", 75), (r"kdenlive|omacut", "Video editor", "film", 33), (r"inkscape", "Inkscape", "pencil", 250),
+  (r"pinta|krita|gimp", "Image editor", "palette", 214), (r"libreoffice-calc", "LibreOffice Calc", "sheet", 41), (r"libreoffice-writer|omawrite", "Writer", "doc", 33),
+  (r"libreoffice-impress", "LibreOffice Impress", "slides", 208), (r"libreoffice", "LibreOffice", "doc", 41), (r"xournal", "Xournal++", "pencil", 250),
+  (r"nautilus|thunar|org\.gnome\.files|yazi|dolphin", "Files", "folder", 214), (r"file-roller|ark$", "Archive manager", "zip", 214),
+  (r"gnome-disks|baobab|disk", "Disks", "disk", 250), (r"mission-?center|resources|system-?monitor|plasma-systemmonitor|btop", "System monitor", "chart", 41),
+  (r"fsearch", "FSearch", "search", 75), (r"docker", "Docker", "docker", 33), (r"omacal", "OmaCal", "cal", 75), (r"omacalc", "Omacalc", "calc", 250),
+  (r"todoist", "Todoist", "check", 203), (r"warp|cloudflare", "Cloudflare WARP", "cloud", 208), (r"localsend", "LocalSend", "down", 75),
+  (r"gedit|textedit|kate", "Text editor", "doc", 250), (r"nvim|neovim", "Neovim", "term", 70), (r"voxtype", "Voxtype", "cog", 250),
+  (r"basecamp", "Basecamp", "check", 41), (r"^flow$", "Flow", "check", 75), (r"google contacts|contacts", "Google Contacts", "chat", 33),
+  (r"google maps", "Google Maps", "web", 41), (r"google messages", "Google Messages", "chat", 33), (r"google photos", "Google Photos", "palette", 214),
+  (r"^hey$", "HEY", "mail", 220), (r"^x$", "X", "web", 255), (r"anime-tool|crunchyroll", "Anime", "tv", 208), (r"rpi-imager", "Raspberry Pi Imager", "disk", 197),
+  (r"crx_dlgohinm", "Todoist", "check", 203), (r"limine|snapper", "Restore snapshot", "disk", 250), (r"ordenador-pendrive", "Pendrive sorter", "disk", 214),
+  (r"file-?roller", "Archive manager", "zip", 214), (r"qv4l2|qvidcap", "Video capture", "video", 250), (r"sidefx", "Houdini Installer", "cube", 208),
+  (r"xfce4-about", "About", "cog", 250),
+  (r"print", "Printing", "print", 250), (r"evince|papers|document-?viewer", "Document viewer", "doc", 203), (r"imv|image-?viewer|loupe|eog", "Image viewer", "palette", 250),
+  (r"udiskie", "udiskie", "disk", 250), (r"monitor-watch", "Monitor watch", "cog", 250),
+]
+CATEGORIES = [("Game", "game", 41), ("Emulator", "game", 41), ("Video", "film", 33), ("AudioVideoEditing", "film", 33), ("Audio", "note", 213), ("Music", "note", 213),
+              ("3DGraphics", "cube", 208), ("Graphics", "palette", 214), ("WebBrowser", "web", 33), ("TerminalEmulator", "term", 250), ("FileManager", "folder", 214),
+              ("TextEditor", "doc", 250), ("IDE", "code", 33), ("Development", "code", 33), ("InstantMessaging", "chat", 33), ("FileTransfer", "down", 33),
+              ("Spreadsheet", "sheet", 41), ("Presentation", "slides", 208), ("WordProcessor", "doc", 33), ("Office", "doc", 33), ("Monitor", "chart", 41),
+              ("Settings", "cog", 250), ("Network", "web", 75), ("System", "cog", 250), ("Utility", "app", 250)]
+_idx = {}
+def desktop_index():
+    """class / .desktop file / name -> (Name, Categories), for apps that are not in the table."""
+    if _idx: return _idx
+    for f in glob.glob("/usr/share/applications/*.desktop") + glob.glob(os.path.expanduser("~/.local/share/applications/*.desktop")) + \
+             glob.glob(os.path.expanduser("~/.local/share/flatpak/exports/share/applications/*.desktop")) + glob.glob("/var/lib/flatpak/exports/share/applications/*.desktop"):
+        c = configparser.RawConfigParser(strict=False, interpolation=None)
+        try: c.read(f, encoding="utf-8")
+        except Exception: continue
+        d = c["Desktop Entry"] if "Desktop Entry" in c else None
+        if not d: continue
+        val = (d.get("Name", ""), d.get("Categories", ""))
+        for k in (d.get("StartupWMClass", ""), os.path.basename(f)[:-8], d.get("Name", "")):
+            if k: _idx.setdefault(k.lower(), val)
+    return _idx
+
+def identify(cls, name):
+    """-> (name, glyph, color). Order: own table > .desktop category > generic."""
+    base = name.split("›")[-1].strip().replace(" (web app)", "")
+    if base in ICONS: return name, ICONS[base], icon_color(name)
+    if name.startswith("Terminal"): return name, G["term"], 250
+    c = cls.lower()
+    for rx, nom, g, col in APPS:
+        if re.search(rx, c) or re.search(rx, name.lower()): return nom, G[g], col
+    ent = desktop_index().get(c)
+    if ent:
+        cats = ent[1].split(";")
+        for cat, g, col in CATEGORIES:
+            if cat in cats: return (ent[0] or name), G[g], col
+        return (ent[0] or name), G["app"], 245
+    return name, G["app"], 245
+
+def friendly_exe(exe):
+    """steamwebhelper -> "Steam (helper)": the same naming the Apps view uses."""
+    base = os.path.basename(exe)
+    nm = identify(base.lower(), base)[0]
+    return nm + " (helper)" if nm != base and "helper" in base.lower() else nm
+
+def work_text(secs): return RP.span(secs)
+
+# ---------------------------------------------------------------- per-process stats
+
+gpu_tot = [None]              # whole GPU: (util %, VRAM used MB, VRAM total MB)
+cpu_pid, gpu_pid = {}, {}     # pid -> % of one core (like top) ; pid -> (sm %, VRAM MB)
+TICK = os.sysconf("SC_CLK_TCK")
+
+def read_cpu():
+    t = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit(): continue
+        try:
+            f = open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()
+            t[int(d)] = int(f[11]) + int(f[12])
+        except Exception: pass
+    return t
+
+def watch_stats():
+    prev, t0 = read_cpu(), time.time()
+    while True:
+        time.sleep(1)
+        now, t1 = read_cpu(), time.time()
+        new = {p: (v - prev[p]) / TICK / (t1 - t0) * 100 for p, v in now.items() if p in prev}
+        gpu = {}
+        for l in sh("nvidia-smi", "pmon", "-c", "1", "-s", "um").splitlines():
+            f = l.split()
+            if not f or f[0].startswith("#") or len(f) < 10: continue
+            try: gpu[int(f[1])] = ((int(f[3]) if f[3].isdigit() else 0), (int(f[9]) if f[9].isdigit() else 0))
+            except ValueError: pass
+        try: tot = tuple(int(v) for v in sh("nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits").splitlines()[0].split(","))
+        except Exception: tot = None
+        with lock:
+            gpu_tot[0] = tot
+            for p, v in new.items(): cpu_pid[p] = 0.5 * cpu_pid.get(p, v) + 0.5 * v
+            old = dict(gpu_pid); gpu_pid.clear()
+            for p, (sm, mb) in gpu.items(): gpu_pid[p] = (0.5 * old.get(p, (sm, 0))[0] + 0.5 * sm, mb)
+            for p in [p for p in cpu_pid if p not in now]: del cpu_pid[p]       # forget dead pids
+        prev, t0 = now, t1
+
+playing_now = [False]          # something is playing media right now (MPRIS): browsers legitimately burn a core then
+crash_cache = [[]]            # crash groups of the last 30 days (see deathcorridor_report.crash_groups)
+
+def watch_problems():
+    while True:
+        try: g = RP.crash_groups(30)
+        except Exception: g = []
+        with lock: crash_cache[0] = g
+        time.sleep(30)
+
+def snapshot():
+    """-> (procs {pid: info}, kids {ppid: [(pid, comm, args)]}). comm only for your own processes."""
+    procs, kids = {}, {}
+    for l in sh("ps", "-eo", "pid=,ppid=,uid=,rss=,stat=,args=").splitlines():
+        f = l.split(None, 5)
+        if len(f) < 5: continue
+        try: pid, ppid, uid, rss = (int(v) for v in f[:4])
+        except ValueError: continue
+        comm = ""
+        if uid == ME:
+            try: comm = open(f"/proc/{pid}/comm").read().strip()
+            except OSError: continue
+        args = f[5] if len(f) > 5 else ""
+        procs[pid] = dict(pid=pid, ppid=ppid, uid=uid, rss=rss, stat=f[4], comm=comm, args=args)
+        kids.setdefault(ppid, []).append((pid, comm, args))
+    return procs, kids
+
+def descendants(pid, kids):
+    res, queue = {pid}, [pid]
+    while queue:
+        for hp, _, _ in kids.get(queue.pop(), []):
+            if hp not in res: res.add(hp); queue.append(hp)
+    return res
+
+def usage(pids, procs):
+    """(cpu %, gpu %, vram MB, rss KB) summed over pids."""
+    with lock:
+        c = sum(cpu_pid.get(p, 0) for p in pids)
+        g = [gpu_pid[p] for p in pids if p in gpu_pid]
+    return c, round(sum(x[0] for x in g)), sum(x[1] for x in g), sum(procs[p]["rss"] for p in pids if p in procs)
+
+# ---------------------------------------------------------------- apps view data
+
+def unit_of(pid):
+    """systemd user unit (app-*.scope / app-*.service) the process lives in, via its cgroup."""
+    try: line = open(f"/proc/{pid}/cgroup").read()
+    except OSError: return None
+    for part in line.strip().split("/"):
+        if part.startswith("app-") and part.endswith((".scope", ".service")): return part
+    return None
+
+def unit_name(u):
+    n = re.sub(r"\\x([0-9a-f]{2})", lambda m: chr(int(m[1], 16)), u)
+    n = re.sub(r"\.(scope|service)$", "", n)
+    n = re.sub(r"^app-", "", n).replace("@autostart", "")
+    n = re.sub(r"^Hyprland-", "", n)
+    n = re.sub(r"-([0-9a-f]{8}|\d+)$", "", n)
+    if "." in n: n = n.split(".")[-1]
+    return n.replace("-", " ")
+
+def collect_apps(procs, kids):
+    """-> (windows, background apps). Background = a systemd app unit with running processes but no window."""
+    try: clients = json.loads(sh("hyprctl", "-j", "clients"))
+    except Exception: return [], []
+    wins, win_units, win_pids = [], set(), set()
+    for c in clients:
+        if not c.get("mapped"): continue
+        win_units.add(unit_of(c["pid"])); win_pids |= descendants(c["pid"], kids)
+        if c["class"] == "TUI.float": continue
+        ws = c["workspace"]["name"].replace("special:", "")
+        try: comm = open(f"/proc/{c['pid']}/comm").read().strip().lower()
+        except Exception: comm = ""
+        w = dict(addr=c["address"], ws=ws, wid=c["workspace"]["id"], cls=c["class"], title=c["title"], pid=c["pid"], comm=comm,
+                 name=friendly_name(c["class"], c["pid"], kids))
+        w["name"], w["glyph"], w["color"] = identify(c["class"], w["name"])
+        w["cpu"], w["gpu"], w["vram"], w["rss"] = usage(descendants(c["pid"], kids), procs)
+        wins.append(w)
+    for w in wins: w["shared"] = sum(1 for y in wins if y["pid"] == w["pid"]) > 1
+    wins.sort(key=lambda w: (w["wid"] < 0, w["wid"], w["cls"]))
+    # several windows of one process (Chrome): only the one whose title matches the playing media "plays"
+    titles = mpris_titles()
+    playing_now[0] = bool(titles)
+    for w in wins:
+        group = [y for y in wins if y["comm"] == w["comm"]]
+        w["plays_ok"] = True
+        if len(group) > 1 and titles:
+            hit = [y for y in group if any(t[:30].lower() in y["title"].lower() for t in titles)]
+            if hit: w["plays_ok"] = w in hit
+            else: w["plays_ok"] = not w["cls"].startswith("chrome-")      # no title matches: the playing tab is in the background of a normal window; web apps only play when their title matches
+    groups = {}
+    for p in procs.values():
+        if p["uid"] != ME: continue
+        u = unit_of(p["pid"])
+        if u and u not in win_units: groups.setdefault(u, []).append(p["pid"])
+    bgs = []
+    for u, pids in groups.items():
+        if win_pids.intersection(pids): continue          # e.g. Chrome: window process and helpers live in different units
+        raw = unit_name(u)
+        name, glyph, color = identify(raw.lower(), raw)
+        b = dict(key=u, name=name, glyph=glyph, color=color, pids=pids, n=len(pids))
+        b["cpu"], b["gpu"], b["vram"], b["rss"] = usage(pids, procs)
+        bgs.append(b)
+    bgs.sort(key=lambda b: b["name"].lower())
+    return wins, bgs
+
+# ---------------------------------------------------------------- processes view data
+
+CHROME_UTILITY = {"network": "network", "storage": "storage", "audio": "audio", "video_capture": "camera", "data_decoder": "decoder"}
+def chrome_role(args):
+    """Chrome runs as many processes all called "chrome": name them by what they do (from their --type flag)."""
+    m = re.search(r"--type=([a-z-]+)", args)
+    t = m.group(1) if m else ""
+    if not t: return "main"
+    if t == "renderer": return "extension" if "--extension-process" in args else "tab"
+    if t == "gpu-process": return "GPU"
+    if t == "utility":
+        sub = re.search(r"--utility-sub-type=(?:[a-z_]+\.)*?([A-Za-z_]+)(?:Service|\b)", args)
+        key = (sub.group(1).lower() if sub else "")
+        return next((v for k, v in CHROME_UTILITY.items() if k in key), "utility")
+    return "helper"
+
+# ending these has a big side effect: ask before doing it
+BIG = {"chrome · main": "closes ALL of Chrome: every tab and web app (WhatsApp, Discord...)", "chrome · helper": "breaks Chrome: it will not be able to open new tabs"}
+
+def proc_name(p):
+    comm = p["comm"]
+    if comm == "chrome" and p["args"].split(" ", 1)[0].endswith("/chrome"): return "chrome · " + chrome_role(p["args"])
+    if comm.lower() in INTERPRETERS:
+        for a in p["args"].split()[1:]:
+            if not a.startswith("-"): return f"{comm} · {os.path.basename(a)}"
+    return comm
+
+def proc_rows(procs):
+    me, rows = os.getpid(), []
+    for p in procs.values():
+        if p["uid"] != ME or p["pid"] == me or p["ppid"] == me: continue      # hide ourselves and our parec helpers
+        with lock: cpu = cpu_pid.get(p["pid"], 0); g = gpu_pid.get(p["pid"], (0, 0))
+        rows.append(dict(key=p["pid"], name=proc_name(p), pid=p["pid"], pids=[p["pid"]], n=1, cpu=cpu, rss=p["rss"], gpu=round(g[0]), vram=g[1]))
+    return rows
+
+def group_rows(rows):
+    g = {}
+    for r in rows:
+        a = g.setdefault(r["name"], dict(key=r["name"], name=r["name"], pid=r["pid"], pids=[], n=0, cpu=0, rss=0, gpu=0, vram=0))
+        a["pids"] += r["pids"]; a["n"] += 1; a["cpu"] += r["cpu"]; a["rss"] += r["rss"]; a["gpu"] += r["gpu"]; a["vram"] += r["vram"]
+        a["pid"] = min(a["pid"], r["pid"])
+    return list(g.values())
+
+SORTS = [("cpu", "CPU", lambda r: int(min(r["cpu"] / NCPU, 100) + 0.5), True), ("mem", "RAM", lambda r: r["rss"] // 51200, True), ("gpu", "GPU", lambda r: (r["gpu"], r["vram"] // 50), True),
+         ("name", "Name", lambda r: r["name"].lower(), False), ("pid", "PID", lambda r: r["pid"], False), ("load", "Load", lambda r: 0, True)]
+
+def system_totals(procs):
+    with lock: cpu = sum(cpu_pid.get(p, 0) for p in procs) / NCPU
+    mem = {}
+    for l in open("/proc/meminfo"):
+        k, v = l.split(":")[0], l.split()[1]
+        if k in ("MemTotal", "MemAvailable"): mem[k] = int(v)
+    return min(cpu, 100), mem.get("MemTotal", 0) - mem.get("MemAvailable", 0), mem.get("MemTotal", 0)
+
+def hypr_dispatch(expr):
+    """Hyprland >= 0.55 with the Lua config: `hyprctl dispatch` takes a Lua dispatcher expression."""
+    out = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True).stdout.decode("utf-8", "replace")
+    return out.strip().startswith("ok")
+
+def my_lineage():
+    """Our own pid and every ancestor (the terminal that hosts us): killing any of them would close deathcorridor itself."""
+    out, p = set(), os.getpid()
+    while p > 1 and p not in out:
+        out.add(p)
+        try: p = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError): break
+    return out
+
+def log_kill(msg):
+    try:
+        d = os.path.expanduser("~/.local/state/deathcorridor"); os.makedirs(d, exist_ok=True)
+        with open(d + "/actions.log", "a") as f: f.write(time.strftime("%F %T ") + msg + "\n")
+    except OSError: pass
+
+def kill_pids(pids, force=True):
+    """SIGTERM, and (force) SIGKILL whatever is still alive 0.8s later. Never touches deathcorridor or the terminal running it."""
+    mine = my_lineage()
+    skipped = [p for p in pids if p in mine]
+    pids = [p for p in pids if p not in mine]
+    log_kill(f"kill force={force} pids={pids}" + (f" skipped(own terminal)={skipped}" if skipped else ""))
+    for p in pids:
+        try: os.kill(p, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError): pass
+    if not force: return
+    def alive(p):
+        try: os.kill(p, 0); return True
+        except (ProcessLookupError, PermissionError): return False
+    for _ in range(8):
+        if not any(alive(p) for p in pids): return
+        time.sleep(0.1)
+    for p in pids:
+        try: os.kill(p, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError): pass
+
+# ---------------------------------------------------------------- formatting
+
+def audio_meter(x, width=12):
+    if x <= 0: return 0
+    db = 20 * math.log10(x)
+    return max(0, min(width, round((db + 48) / 48 * width)))
+
+def marquee(txt, width, t, phase=0.0):
+    """If it does not fit, slides back and forth (pausing at the ends); if it fits, stays put."""
+    if len(txt) <= width: return txt.ljust(width)
+    extra = len(txt) - width
+    speed, pause = 7.0, 1.2                     # chars/sec, seconds still at each end
+    run = extra / speed
+    cycle = 2 * (run + pause)
+    u = (t + phase) % cycle
+    if u < pause: off = 0
+    elif u < pause + run: off = (u - pause) * speed
+    elif u < 2 * pause + run: off = extra
+    else: off = extra - (u - 2 * pause - run) * speed
+    off = int(round(off))
+    return txt[off: off + width]
+
+def fmt_mb(mb): return f"{mb/1024:.1f}G" if mb >= 1024 else f"{mb:.0f}M"
+def fmt_kb(kb): return fmt_mb(kb / 1024)
+def lvl(v, a, b): return 3 if v >= b else (2 if v >= a else 1)             # 1 green · 2 yellow · 3 red
+def lvl_mem(kb): return 3 if kb >= 6_000_000 else (2 if kb >= 2_000_000 else 6)
+
+# ---------------------------------------------------------------- theme
+
+def hex256(h):
+    """'#rrggbb' -> nearest xterm-256 index."""
+    r, g, b = (int(h.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    return min(COLOR256, key=lambda i: sum((x - y) ** 2 for x, y in zip((r, g, b), COLOR256[i])))
+
+def _rgb256(i):
+    if i >= 232: v = 8 + 10 * (i - 232); return (v, v, v)
+    i -= 16; lv = (0, 95, 135, 175, 215, 255)
+    return (lv[i // 36], lv[(i // 6) % 6], lv[i % 6])
+COLOR256 = {i: _rgb256(i) for i in range(16, 256)}
+
+def theme():
+    """Active Omarchy theme palette -> {name: 256 index}. Uses colors.toml; missing keys are derived from
+    color0..15 (ANSI) or alacritty.toml. {} if nothing readable (the script falls back to its own colors)."""
+    import tomllib
+    d = os.path.expanduser("~/.local/state/omarchy/current/theme/")
+    def load(name):
+        try:
+            with open(d + name, "rb") as f: return tomllib.load(f)
+        except Exception: return {}
+    hx = lambda v: v.replace("0x", "#") if isinstance(v, str) else None
+    t = {k: hx(v) for k, v in load("colors.toml").items() if isinstance(hx(v), str) and hx(v).startswith("#")}
+    if "background" not in t:                                      # theme without colors.toml: read alacritty.toml
+        al = load("alacritty.toml").get("colors", {})
+        t.update({k: hx(v) for k, v in (("background", al.get("primary", {}).get("background")), ("foreground", al.get("primary", {}).get("foreground")))
+                  if v})
+        for i, n in enumerate(("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")):
+            if al.get("normal", {}).get(n): t.setdefault(f"color{i}", hx(al["normal"][n]))
+            if al.get("bright", {}).get(n): t.setdefault(f"color{i + 8}", hx(al["bright"][n]))
+    if "background" not in t or "foreground" not in t: return {}
+    rgb = lambda h: tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+    mix = lambda a, b, k: "#%02x%02x%02x" % tuple(round(x + (y - x) * k) for x, y in zip(rgb(a), rgb(b)))
+    bg, fg = t["background"], t["foreground"]
+    t.setdefault("selection", mix(bg, fg, 0.14))                   # selected row: just a bit lighter than the background
+    t.setdefault("muted", mix(bg, fg, 0.5))
+    for name, n in (("red", 1), ("green", 2), ("yellow", 3), ("blue", 4), ("magenta", 5), ("cyan", 6)):
+        t.setdefault(name, t.get(f"color{n}", fg))
+        t.setdefault(f"bright_{name}", t.get(f"color{n + 8}", t[name]))
+    t.setdefault("accent", t["blue"])
+    return {k: hex256(v) for k, v in t.items() if re.fullmatch(r"#[0-9a-fA-F]{6}", v)}
+
+# ---------------------------------------------------------------- UI
+
+STATS_W = 34        # right block, same in both views: CPU(6) 2 GPU(4) 2 VRAM(6) 2 RAM(6) 2 [✕](3)
+
+def stat_x(w):
+    sx = w - STATS_W
+    return sx, sx + 8, sx + 14, sx + 22          # CPU, GPU, VRAM, RAM
+
+
+def main(scr):
+    curses.curs_set(0); curses.use_default_colors(); scr.timeout(60)
+    T = theme() if curses.COLORS >= 256 else {}
+    BG = T.get("background", 234) if curses.COLORS >= 256 else curses.COLOR_BLACK
+    SEL = T.get("selection", 238) if curses.COLORS >= 256 else curses.COLOR_BLUE   # uniform selected-row background (no A_REVERSE)
+    ACCENT = T.get("accent", 208) if curses.COLORS >= 256 else 3
+    cols = [T.get("green", 77), T.get("yellow", 221), T.get("red", 203), T.get("cyan", 80), T.get("muted", 244), T.get("foreground", 252)] if curses.COLORS >= 256 else [2, 3, 1, 6, 7, 7]
+    # one color per workspace from the theme (1..9 fixed; named/special ones are stable by hash)
+    WS_PALETTE = [T.get(k, d) for k, d in (("accent", 208), ("cyan", 80), ("green", 77), ("blue", 110), ("magenta", 175),
+                                           ("yellow", 221), ("red", 203), ("bright_cyan", 116), ("bright_magenta", 182))] if curses.COLORS >= 256 else [3, 6, 2, 4, 5, 3, 1, 6, 5]
+    def ws_color(x):
+        wid = x["wid"]
+        return WS_PALETTE[(wid - 1) % 9] if wid > 0 else WS_PALETTE[zlib.crc32(x["ws"].encode()) % 9]
+    hdr = {}
+    def hdr_pair(c):                              # dark text on a solid color
+        if c not in hdr:
+            hdr[c] = 120 + len(hdr); curses.init_pair(hdr[c], BG, c)
+        return curses.color_pair(hdr[c])
+    for i, c in enumerate(cols):
+        curses.init_pair(i + 1, c, BG)
+        curses.init_pair(i + 11, c, SEL)           # same colors on the selected-row background
+    pairs = {}
+    def fg_pair(c, sel=False):
+        if (c, sel) not in pairs:
+            pairs[(c, sel)] = 20 + len(pairs); curses.init_pair(pairs[(c, sel)], c if curses.COLORS >= 256 else 7, SEL if sel else BG)
+        return curses.color_pair(pairs[(c, sel)])
+    P = lambda n, sel=False: curses.color_pair(n + 10 if sel else n)
+    scr.bkgd(" ", curses.color_pair(6))          # own solid background (does not depend on terminal transparency)
+    curses.mousemask(curses.ALL_MOUSE_EVENTS); curses.mouseinterval(0)          # clicks arrive as plain press/release
+    WHEEL_UP, WHEEL_DOWN = getattr(curses, "BUTTON4_PRESSED", 0), getattr(curses, "BUTTON5_PRESSED", 0)
+
+    def put(y, x, txt, attr=0):
+        h, w = scr.getmaxyx()
+        if y < 0 or y >= h or x >= w or x < 0: return
+        try: scr.addstr(y, x, txt[: max(0, w - x - 1)], attr | curses.A_BOLD)
+        except curses.error: pass
+
+    def banner(a, room):
+        """Plain-language alert, longest version that fits in `room` columns (None if even the shortest does not)."""
+        name, (kind, secs) = a
+        t = work_text(secs)
+        if kind == "stuck": opts = (f" ⚠ {name} is not responding ({secs}s) · F2 to fix it ", f" ⚠ {name} not responding ({secs}s) · F2 ", f" ⚠ {name} stuck ({secs}s) ")
+        else: opts = (f" ◔ {name} has been working hard for {t} · F2 if it is frozen ", f" ◔ {name} busy for {t} · F2 ", f" ◔ {name} busy {t} ")
+        return next((o for o in opts if len(o) <= room), None)
+
+    def draw_stats(y, w, r, sel):
+        base = curses.A_BOLD if sel else 0
+        xc, xg, xv, xr = stat_x(w)
+        cpu = min(r["cpu"] / NCPU, 100)                                # % of the whole machine (like Windows), not of one core
+        put(y, xc, f"{cpu:4.0f}%" + ("*" if r.get("shared") else " "), P(lvl(cpu, 5, 15), sel) | base)
+        if r["gpu"] or r["vram"]:
+            put(y, xg, f"{min(r['gpu'], 99):>3}%", P(lvl(r["gpu"], 30, 70), sel) | base)
+            put(y, xv, fmt_mb(r["vram"]).rjust(6), P(5, sel) | base)
+        else:
+            put(y, xg, "—".rjust(4), P(5, sel)); put(y, xv, "—".rjust(6), P(5, sel))
+        put(y, xr, fmt_kb(r["rss"]).rjust(6), P(lvl_mem(r["rss"]), sel) | base)
+
+    def draw_stat_heads(y, w, active=None, arrow=""):
+        xc, xg, xv, xr = stat_x(w)
+        for label, x, width, pad in (("CPU", xc, 5, " "), ("GPU", xg, 4, ""), ("VRAM", xv, 6, ""), ("RAM", xr, 6, "")):
+            t = (arrow + label) if active == label else label
+            put(y, x, t.rjust(width) + pad, P(5) | curses.A_BOLD)
+
+    def draw_kill(y, w, sel):
+        """Red ✕ on the selected row only (also right after launch, before anything is picked): click it (or press x / Del) to end that task."""
+        if not sel: return
+        kx = stat_x(w)[0] + 30
+        if picked[view]: put(y, kx, " ✕ ", hdr_pair(cols[2]) | curses.A_BOLD)
+        else:            put(y, kx, " ✕ ", fg_pair(cols[2], True) | curses.A_BOLD)       # not picked yet: dim until you click it
+        hit_kill[y] = (kx, kx + 3)
+
+    threading.Thread(target=watch_audio, daemon=True).start()
+    threading.Thread(target=watch_stats, daemon=True).start()
+    threading.Thread(target=watch_problems, daemon=True).start()
+
+    view = 0                                       # 0 apps · 1 processes · 2 jail (opened with F2 / click, not part of Tab)
+    last_main = 0
+    cur_ai, ai_menu, ai_asked = RP.chosen(), None, False          # the AI that fixes things; menu shown once on entering JAIL if the user never chose
+    W = WT.Watch()                                 # programs the user flagged to follow (key w)
+    prob_rows = []
+    wins, bgs, rows_all, procs_now = [], [], [], {}
+    sums = (0, 0, 0)
+    BUSY_CPU, BUSY_S, STUCK_S = 90, 120, 5         # busy = a full core (% of one core) for 2 min · stuck = blocked in uninterruptible wait (state D) for 5 s
+    busy_since, d_since, alert = {}, {}, None
+    def health(pids):
+        """-> ("stuck", secs) | ("busy", secs) | None for a group of pids."""
+        t = time.time()
+        st = max((t - d_since[p] for p in pids if p in d_since), default=0)
+        if st >= STUCK_S: return ("stuck", int(st))
+        bz = max((t - busy_since[p] for p in pids if p in busy_since), default=0)
+        if bz >= BUSY_S: return ("busy", int(bz))
+        return None
+    def health_rank(r):
+        h = health(r["pids"])
+        return 2 if h and h[0] == "stuck" else 1 if h else 0
+    def bad_pid(p):
+        t = time.time()
+        return (p in d_since and t - d_since[p] >= STUCK_S) or (p in busy_since and t - busy_since[p] >= BUSY_S)
+    last, msg, msg_until = 0, "", 0
+    sel = {0: None, 1: None, 2: None}              # selected key per view
+    smooth = {}
+    sort_i, sort_desc, grouped, filt = 5, True, True, ""          # Load: the most important thing first          # open Processes because something hung: the CPU hog goes first
+    keys, items, rows = [], [], []
+    picked = {0: False, 1: False, 2: False}        # True once the user chose a row (arrows / click): only then x, Del and ✕ act
+    typing_mode = False                            # '/' pressed: next letters go to the search box even if it is "x"
+    armed = None                                   # protected-process kill waiting for a second x
+
+    def say(t, secs=3): nonlocal msg, msg_until; msg, msg_until = t, time.time() + secs
+    click = (None, 0)                              # last clicked row key and time (double-click detection)
+
+    def move(d):
+        n = len(keys)
+        if not n: return
+        i = keys.index(sel[view]) if sel[view] in keys else 0
+        sel[view] = keys[max(0, min(n - 1, i + d))]; picked[view] = True
+
+    def act(name):
+        """Shared by keyboard and mouse. Returns True when deathcorridor should exit."""
+        nonlocal last, armed, grouped, sort_desc
+        if name == "quit": return True
+        if view == 2:
+            if name in ("kill", "close"): say("Press Enter to have the AI fix it. To end a task use Apps or Processes.")
+            return False
+        if sel[view] not in keys: return False
+        if name == "kill" and not picked[view]:
+            say("Pick a row first (arrows or click), then end it"); return False
+        if name == "kill": picked[view] = False              # one kill per pick: choose the next row on purpose
+        i = keys.index(sel[view])
+        if view == 0:
+            kind, key = sel[0]; obj = items[i][2]
+            if name == "go":
+                if kind == "w":
+                    hypr_dispatch(f'hl.dsp.focus({{ window = "address:{key}" }})'); return True          # also switches to its workspace
+                say(f"{obj['name']} has no window (background app)")
+            elif name == "close":
+                if kind == "w":
+                    hypr_dispatch(f'hl.dsp.window.close({{ window = "address:{key}" }})'); last = 0; say("Closed")
+                else:
+                    kill_pids(obj["pids"], force=False); last = 0; say(f"Asked {obj['name']} to quit")
+            elif name == "kill":
+                pids = [obj["pid"]] if kind == "w" else obj["pids"]
+                kill_pids(pids); last = 0; say(f"Ended {obj['name']} ({len(pids)} process{'es' if len(pids) != 1 else ''})")
+        elif name == "kill":
+            row = rows[i]
+            bad = [p for p in row["pids"] if bad_pid(p)] if row["n"] > 1 else []        # a group with a stuck / busy member: end only that one
+            if row["name"] in BIG and armed != row["key"]:
+                armed = row["key"]; picked[view] = True; say(f"{row['name']} {BIG[row['name']]}. Press x / click ✕ again to confirm"); return False
+            if (row["name"] in PROTECTED or (row["n"] > 1 and not bad)) and armed != row["key"]:
+                armed = row["key"]; picked[view] = True
+                say(f"{row['name']} is critical. Press x / click ✕ again to confirm" if row["name"] in PROTECTED
+                    else f"{row['name']} has {row['n']} processes: this ends all of them. Press x / click ✕ again to confirm"); return False
+            armed = None
+            kill_pids(bad or row["pids"]); last = 0
+            if bad: say(f"Ended the {len(bad)} stuck/busy {row['name']} (the other {row['n'] - len(bad)} keep running)")
+            else: say(f"Ended {row['name']}" + (f" ({row['n']} processes)" if row["n"] > 1 else f" (PID {row['pid']})"))
+        return False
+
+    def subject_of_selection():
+        """The thing the user picked, as {name, pids, exe, note} for the report builder (culprit pids first)."""
+        if sel[view] is None or sel[view] not in keys: return None
+        i = keys.index(sel[view])
+        if view == 0:
+            kind, _ = sel[0]; obj = items[i][2]
+            pids = ([obj["pid"]] + [p for p in obj.get("tree", []) if p != obj["pid"]]) if kind == "w" else list(obj["pids"])
+            hl = obj.get("health"); name = obj["name"]
+        elif view == 1:
+            row = rows[i]; pids = sorted(row["pids"], key=lambda p: not bad_pid(p)); hl = health(row["pids"]); name = row["name"]
+        else:
+            row = next((r for r in prob_rows if r["key"] == sel[2]), None)
+            if not row: return None
+            return dict(name=row["name"], pids=row["pids"], exe=row["exe"], note=row["note"])
+        pids = sorted(pids, key=lambda p: not bad_pid(p))
+        return dict(name=name, pids=pids, exe=None, note=(f"Flagged live by deathcorridor: {hl[0]} for {hl[1]}s." if hl else "Picked by the user in deathcorridor for analysis."))
+
+    def dismiss_selected():
+        row = next((r for r in prob_rows if r["key"] == sel[2]), None)
+        if row and row.get("watched"): toggle_watch(); return
+        if not row or row["live"]: say("Only past crashes can be released"); return
+        RP.dismiss(row["exe"], row["last"])
+        with lock: crash_cache[0] = RP.crash_groups(30)
+        prob_rows[:] = [r for r in prob_rows if r["key"] != row["key"]]
+        sel[2] = None; picked[2] = False
+        say(f"Released {row['name']}. It comes back only if it crashes again.")
+
+    def toggle_watch():
+        """w: follow this program (record what happens to it, track the fix) / stop following it."""
+        subj = subject_of_selection()
+        if not subj: say("Pick a row first (arrows or click), then press w to follow it"); return
+        exe = subj.get("exe") or W.exe_of(subj["pids"])
+        if not exe: say(f"{subj['name']} is not running, nothing to follow yet"); return
+        if W.toggle(exe, subj["name"]):
+            say(f"Following {subj['name']}. I record what happens to it; it shows in JAIL. Press w again to stop.", 6)
+        else:
+            say(f"Stopped following {subj['name']}")
+            prob_rows[:] = [r for r in prob_rows if r.get("exe") != exe or not r.get("watched")]
+            if view == 2: sel[2] = None; picked[2] = False
+        W.pids = set()
+
+    def start_report():
+        """Fix it: collect the case, open claude with it, and take the item off the list (it comes back if it fails again)."""
+        nonlocal view, cur_ai
+        if cur_ai is None:                                                   # never chose an AI: pick it first (JAIL asks)
+            inst = RP.installed()
+            if len(inst) == 1: RP.set_ai(inst[0]); cur_ai = inst[0]
+            elif len(inst) > 1: view = 2; say("Choose your AI first, then press Enter again.", 6); return
+        subj = subject_of_selection()
+        if not subj: say("Pick a row first"); return
+        row = next((r for r in prob_rows if r["key"] == sel[2]), None) if view == 2 else None
+        wexe = subj.get("exe") or W.exe_of(subj["pids"])
+        if not W.has(wexe): wexe = None
+        if wexe: subj["exe"] = wexe; subj["tracking"] = W.tracking_text(wexe)       # a followed program: the AI also gets its whole timeline
+        say(f"Opening the AI for {subj['name']}…", 12)
+        def work():
+            try:
+                RP.ensure_config()
+                tool, script = RP.pick_ai()
+                text, n = RP.build_report(subj); RP.save(subj["name"], text)
+                if not script:                                              # no AI to open: hand the case over through the clipboard
+                    subprocess.run(["wl-copy"], input=(RP.prompt_for(None) + text).encode(), timeout=3)
+                    say(f"{tool.capitalize()}. The case is copied: paste it into any AI.", 10)
+                    if wexe: W.mark_fix_sent(wexe)
+                    return
+                pf = RP.save(subj["name"] + "-prompt", RP.prompt_for(tool) + text)
+                subprocess.Popen(["omarchy-launch-tui", "bash", "-lc", script, pf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                say(f"Done: {tool} is looking into {subj['name']} in a new window.", 6)
+                if wexe: W.mark_fix_sent(wexe)
+            except Exception as e: say(f"Could not open the AI: {e}", 8)
+        threading.Thread(target=work, daemon=True).start()
+        if row and not row["live"] and not row.get("watched"):
+            RP.dismiss(row["exe"], row["last"])
+            with lock: crash_cache[0] = [g for g in crash_cache[0] if g["exe"] != row["exe"]]      # gone right now, not at the next 30 s refresh
+            prob_rows[:] = [r for r in prob_rows if r["key"] != row["key"]]; sel[2] = None; picked[2] = False
+
+    while True:
+        if time.time() - last > 1:
+            procs_now, kids = snapshot()
+            wins, bgs = collect_apps(procs_now, kids)
+            rows_all = proc_rows(procs_now)
+            sums = system_totals(procs_now)
+            tnow = time.time()
+            with lock: cp = dict(cpu_pid)
+            for pid_, p_ in procs_now.items():                               # only your own processes: root kernel threads blink in D all the time
+                if p_["uid"] != ME: d_since.pop(pid_, None); busy_since.pop(pid_, None); continue
+                if p_["stat"][:1] == "D": d_since.setdefault(pid_, tnow)
+                else: d_since.pop(pid_, None)
+                if cp.get(pid_, 0) >= BUSY_CPU and not (p_["comm"] == "chrome" and playing_now[0]): busy_since.setdefault(pid_, tnow)
+                else: busy_since.pop(pid_, None)
+            for d_ in (d_since, busy_since):
+                for k_ in [k_ for k_ in d_ if k_ not in procs_now]: del d_[k_]
+            for x_ in wins: x_["tree"] = sorted(descendants(x_["pid"], kids))[:60]; x_["health"] = None if x_.get("shared") else health(x_["tree"])      # windows sharing one process (Chrome + its web apps) cannot be told apart: judged per process instead
+            for x_ in bgs: x_["health"] = health(x_["pids"])
+            cands = [(x_["name"], x_["health"]) for x_ in wins + bgs if x_["health"]] + [(r_["name"], r_["health"]) for r_ in rows_all if (r_.__setitem__("health", health(r_["pids"])) or r_["health"])]
+            alert = max(cands, key=lambda c_: (c_[1][0] == "stuck", c_[1][1])) if cands else None
+            with lock: crashes_ = list(crash_cache[0])
+            for msg_ in W.update(procs_now, lambda p_: cp.get(p_, 0), health, crashes_):
+                say(msg_, 10); subprocess.Popen(["notify-send", "deathcorridor", msg_], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            prob_rows = []                                                  # Problems: not responding / working hard right now, then crash history
+            seen_ = set()
+            def live_row(key, name, pids, hl):
+                kd_, sc_ = hl
+                if kd_ == "stuck": what, det = f"Not responding for {sc_}s", f"{name} is waiting on the disk or a device and is not answering. Press Enter and the AI will look into it."
+                else: what, det = f"Working hard for {work_text(sc_)}", f"{name} has used a full CPU core for {work_text(sc_)}. That is normal for a render or a game; if it looks frozen, press Enter and the AI will look into it."
+                return dict(key=key, name=name, what=what, live=True, stuck=kd_ == "stuck", count=0, last=time.time(), pids=pids, exe=None, attention=True, detail=det,
+                            note=f"Flagged live by deathcorridor: {'not responding (blocked in the kernel)' if kd_ == 'stuck' else 'using a full CPU core'} for {sc_}s.")
+            for x_ in wins + bgs:
+                if x_["health"]:
+                    pl_ = x_.get("tree") or x_.get("pids") or []; seen_ |= set(pl_)
+                    prob_rows.append(live_row(("l", x_.get("addr") or x_["key"]), x_["name"], pl_, x_["health"]))
+            for r_ in rows_all:
+                if r_["health"] and r_["pid"] not in seen_: prob_rows.append(live_row(("l", r_["pid"]), r_["name"], [r_["pid"]], r_["health"]))
+            with lock: cg_ = list(crash_cache[0])
+            for g_ in cg_:
+                if g_["count"] < 2 or W.has(g_["exe"]): continue    # a flagged program has its own row                                # a single crash is not worth anyone's attention
+                nm_ = friendly_exe(g_["exe"]); short_, long_ = RP.explain(g_["sigs"][0])
+                det_ = f"{nm_} keeps closing by itself ({g_['count']} times in {RP.span(g_['last'] - g_['first'])}): {long_}. Press Enter and the AI will look into it and fix it, asking you first."
+                prob_rows.append(dict(key=("c", g_["exe"]), name=nm_, what=f"Keeps crashing ({g_['count']} times)", live=False, stuck=False, count=g_["count"], last=g_["last"], pids=[],
+                                      exe=g_["exe"], attention=True, detail=det_, note=""))
+            prob_rows += W.rows()
+            prob_rows.sort(key=lambda r_: (not r_["attention"], not r_["live"], -r_["last"]))
+            last = time.time()
+        h, w = scr.getmaxyx(); scr.erase()
+        now = time.time()
+        hit_an, hit_dis, hit_menu, hit_ai = {}, {}, {}, None
+        hit_rows, hit_tabs, hit_heads, hit_kill, hit_group = {}, [], [], {}, None       # clickable regions, rebuilt every frame
+
+        # tab bar: brand band, tabs; totals on the right always win, so the left side shrinks to fit
+        cpu_t, used, total = sums
+        with lock: gtot = gpu_tot[0]
+        TOT = 48 if curses.COLORS >= 256 else cols[0]          # totals get their own green so they read as one group, apart from the per-row colors
+        MUTED = P(5)
+        def tone(frac, a, b): return (P(3) if frac >= b else P(2) if frac >= a else fg_pair(TOT)) | curses.A_BOLD     # green normally, yellow / red when high
+        TRACK = 238 if curses.COLORS >= 256 else cols[4]
+        def bar(frac, n):                                    # solid cells: filled part in the tone color, empty part on a visible gray track
+            k = max(0, min(n, int(round(frac * n))))
+            c = cols[2] if frac >= 0.9 else cols[1] if frac >= 0.75 else TOT
+            return [(" " * k, hdr_pair(c)), (" " * (n - k), hdr_pair(TRACK))]
+        def seg_cpu(full):
+            return [(f"CPU {cpu_t:>3.0f}%" + (f" of {NCPU} cores" if full else ""), tone(cpu_t / (NCPU * 100), 0.5, 0.85) if cpu_t >= 50 else fg_pair(TOT) | curses.A_BOLD)]
+        def seg_ram(n, of):
+            f = used / total if total else 0
+            r = [("RAM ", MUTED)] + (bar(f, n) if n else []) + [(" " if n else "", 0), (fmt_kb(used).rjust(len(fmt_kb(total))), tone(f, 0.75, 0.9))]       # fixed width: neighbours never shift
+            return r + ([(f" of {fmt_kb(total)}", MUTED)] if of else [])
+        def seg_gpu(n, vram):
+            u, mu, mt = gtot
+            r = [("GPU ", MUTED)] + (bar(u / 100, n) if n else []) + [(" " if n else "", 0), (f"{u:>3}%", tone(u / 100, 0.6, 0.9))]
+            return r + ([(f" {fmt_mb(mu).rjust(len(fmt_mb(mt)))} of {fmt_mb(mt)}", MUTED)] if vram else [])
+        # (WHOLE PC label, full CPU text, bar width, "of total" text, GPU VRAM text, GPU shown)
+        LEVELS = ((True, True, 10, True, True, True), (False, True, 8, True, True, True), (False, False, 8, True, True, True), (False, False, 6, True, False, True),
+                  (False, False, 6, False, False, True), (False, False, 6, False, False, False), (False, False, 0, False, False, False))
+        if view != 2: last_main = view; ai_asked = False
+        elif cur_ai is None and ai_menu is None and not ai_asked:                  # entering JAIL without a chosen AI
+            ai_asked = True
+            inst_ = RP.installed()
+            if len(inst_) == 1: RP.set_ai(inst_[0]); cur_ai = inst_[0]              # only one installed: nothing to ask
+            elif len(inst_) > 1: ai_menu = dict(items=[(t_, RP.LABELS[t_]) for t_ in inst_], idx=0)
+        attn = any(r["attention"] for r in prob_rows)
+        JAIL = " JAIL " + ("● " if attn else "")
+        TABS = (" Apps ", " Processes ")
+        tabs_w = sum(len(t) + 1 for t in TABS) + 2 + len(JAIL)
+        min_left = 1 + len(" DEATHCORRIDOR ") + 2 + tabs_w
+        right = []
+        for lab, cf, n, of, vr, g in LEVELS:
+            segs = ([[("WHOLE PC", fg_pair(TOT))]] if lab else []) + [seg_cpu(cf), seg_ram(n, of)] + ([seg_gpu(n, vr)] if g and gtot else [])
+            width = sum(len(t) for sg in segs for t, _ in sg) + 2 * (len(segs) - 1)
+            right = (segs, width)
+            if min_left + 2 + width + 2 <= w: break
+        else: right = ([], 0)
+        segs, rw = right
+        rx = w - 2 - rw
+        limit = rx - 2 if segs else w
+        for brand in (" DEATHCORRIDOR † task manager ", " DEATHCORRIDOR † ", " DEATHCORRIDOR "):
+            if 1 + len(brand) + 2 + tabs_w <= limit: break
+        put(0, 1, brand, hdr_pair(cols[2]) | curses.A_BOLD)
+        x0 = 1 + len(brand) + 2
+        for i, label in enumerate(TABS):
+            if i == view: put(0, x0, label, hdr_pair(ACCENT) | curses.A_BOLD)
+            else:         put(0, x0, label, fg_pair(ACCENT) | curses.A_BOLD)
+            hit_tabs.append((x0, x0 + len(label), i))
+            x0 += len(label) + 1
+        put(0, x0, "│", P(5))                                              # JAIL is not a tab: a separate place to look at, not part of the Tab cycle
+        jx = x0 + 2
+        put(0, jx, JAIL, hdr_pair(cols[3]) | curses.A_BOLD if view == 2 else fg_pair(cols[1] if attn else cols[3]) | curses.A_BOLD)
+        hit_tabs.append((jx, jx + len(JAIL), 2))
+        x = rx
+        for sg in segs:
+            for t, at in sg:
+                if t: put(0, x, t, at); x += len(t)
+            x += 2
+        if view == 0:
+            # ---- Apps: [ws header, windows...] + [background header, bg apps...]
+            q = filt.lower()
+            vwins = [x for x in wins if not q or q in x["name"].lower() or q in x["title"].lower() or q in x["cls"].lower()]
+            vbgs = [b for b in bgs if not q or q in b["name"].lower()]
+            items = [("w", x["addr"], x) for x in vwins] + [("b", b["key"], b) for b in vbgs]
+            keys = [(k, key) for k, key, _ in items]
+            if sel[0] is None:                                               # opening with a problem app: start on it
+                bad = next(((k, key) for k, key, o in items if o.get("health")), None)
+                if bad: sel[0] = bad
+            if sel[0] not in keys: sel[0] = keys[0] if keys else None
+            i_sel = keys.index(sel[0]) if sel[0] else 0
+            lines, last_ws = [], None
+            for x in vwins:
+                if x["ws"] != last_ws:
+                    lines.append(("ws", x["ws"], sum(1 for y in vwins if y["ws"] == x["ws"]), ws_color(x))); last_ws = x["ws"]
+                lines.append(("w", x))
+            if vbgs:
+                if vwins: lines.append(("gap",))
+                lines.append(("bgh", len(vbgs)))
+                lines += [("b", b) for b in vbgs]
+            idx = next((k for k, f in enumerate(lines) if f[0] in ("w", "b") and (f[0], f[1]["addr" if f[0] == "w" else "key"]) == sel[0]), 0)
+            name_w = max(12, min(24, (w - 21 - STATS_W - 4) // 3))
+            tx = 21 + name_w + 2
+            sx = stat_x(w)[0]
+            put(1, 1, "Search: ", P(5))                                   # typing anywhere in this view lands here
+            if filt: put(1, 9, filt + ("█" if typing_mode else ""), P(6) | curses.A_BOLD)
+            else:    put(1, 9, "Ctrl+F to search by app or window title" if not typing_mode else "█", P(5))
+            if alert:
+                bx = 9 + max(len(filt), 40) + 3
+                bn = banner(alert, w - 3 - bx)
+                if bn: put(1, bx, bn, hdr_pair(cols[2] if alert[1][0] == "stuck" else cols[1]) | curses.A_BOLD)
+            put(2, 21, "Name", P(5) | curses.A_BOLD); put(2, tx, "Title / details", P(5) | curses.A_BOLD)
+            draw_stat_heads(2, w)
+            if not lines: put(3, 21, "No apps match", P(5))
+            body = h - 4
+            top = max(0, min(idx - body // 2, len(lines) - body))
+            for r, f in enumerate(lines[top: top + body]):
+                y = 3 + r
+                if f[0] == "gap": continue
+                if f[0] == "ws":
+                    t = f" WORKSPACE {f[1]}"
+                    n = f"{f[2]} window{'s' if f[2] != 1 else ''}"
+                    put(y, 0, " " * (w - 1), hdr_pair(f[3]))                        # solid band in the workspace color, dark text
+                    put(y, 1, t[:19].ljust(19), hdr_pair(f[3]) | curses.A_BOLD)
+                    put(y, 21, n, hdr_pair(f[3]) | curses.A_BOLD)                  # count always starts at the Name column
+                    continue
+                if f[0] == "bgh":
+                    t = " BACKGROUND"
+                    n = f"{f[1]} app{'s' if f[1] != 1 else ''} running without a window"
+                    put(y, 0, " " * (w - 1), hdr_pair(cols[4]))                     # gray band: not a workspace
+                    put(y, 1, t[:19].ljust(19), hdr_pair(cols[4]) | curses.A_BOLD)
+                    put(y, 21, n, hdr_pair(cols[4]) | curses.A_BOLD)
+                    continue
+                x = f[1]; kind = f[0]
+                key = x["addr"] if kind == "w" else x["key"]
+                esta = (kind, key) == sel[0]
+                hit_rows[y] = (kind, key)
+                base = curses.A_BOLD if esta else 0
+                if esta: put(y, 1, " " * (w - 2), P(6, True))
+                bar = ws_color(x) if kind == "w" else cols[4]
+                put(y, 1, " ▸ " if esta else "   ", fg_pair(bar, esta) | curses.A_BOLD)
+                put(y, 0, "▌", fg_pair(bar, esta))                        # side bar in the workspace color
+                if kind == "w":
+                    with lock: peak, ts = level_by_bin.get(x["comm"], (0, 0))
+                    live = now - ts < 0.5 and x["plays_ok"]
+                    tgt = audio_meter(peak) if live else 0
+                    s = smooth.get(x["addr"], 0)
+                    s = tgt if tgt >= s else max(tgt, s - 1)          # rises fast, falls smoothly
+                    smooth[x["addr"]] = s
+                    if live or s:
+                        for k in range(12):
+                            col = 1 if k < 7 else (2 if k < 10 else 3)
+                            put(y, 4 + k, "█" if k < s else "▪", P(col if k < s else 5, esta))
+                    detail = x["title"]
+                    phase = (hash(x["addr"]) % 100) / 25
+                else:
+                    detail = f"{x['n']} process{'es' if x['n'] != 1 else ''}"
+                    phase = (hash(x["key"]) % 100) / 25
+                nm = x["name"] if len(x["name"]) <= name_w else x["name"][: name_w - 1] + "…"
+                txt_attr = P(6 if kind == "w" or esta else 5, esta) | base
+                put(y, 21, nm.ljust(name_w), txt_attr)
+                hl = x.get("health")
+                if hl:                                                      # plain-language status badge before the title
+                    tag = (f" ⚠ Not responding {hl[1]}s " if hl[0] == "stuck" else f" ◔ Busy {work_text(hl[1])} ")
+                    put(y, tx, tag, hdr_pair(cols[2] if hl[0] == "stuck" else cols[1]) | curses.A_BOLD)
+                    put(y, tx + len(tag) + 1, marquee(detail, max(8, sx - 2 - tx - len(tag) - 1), now, phase), P(5, esta) | base)
+                else:
+                    put(y, tx, marquee(detail, max(8, sx - 2 - tx), now, phase), P(5, esta) | base)
+                put(y, 18, x["glyph"], fg_pair(x["color"], esta) | curses.A_BOLD)
+                if W.pids and W.pids & set(x.get("tree") or x.get("pids") or []): put(y, 20, "◉", fg_pair(ACCENT, esta) | curses.A_BOLD)
+                draw_stats(y, w, x, esta); draw_kill(y, w, esta)
+        elif view == 1:
+            # ---- Processes
+            rows = group_rows(rows_all) if grouped else list(rows_all)
+            if filt: rows = [r for r in rows if filt.lower() in r["name"].lower() or filt in str(r["pid"])]
+            if sort_i == 5:     # Load: stuck / busy first, then how busy it is in its busiest resource (CPU core % or GPU %, in steps of 5), then RAM
+                keyf = lambda r: (health_rank(r), int(max(r["cpu"], r["gpu"]) // 5), r["rss"] // 51200)
+            elif sort_i in (0, 2): keyf = lambda r: (SORTS[sort_i][2](r), r["rss"])      # ties (idle = all 0%) fall back to RAM
+            else: keyf = SORTS[sort_i][2]
+            rows.sort(key=keyf, reverse=sort_desc)
+            keys = [r["key"] for r in rows]
+            if sel[1] not in keys: sel[1] = keys[0] if keys else None
+            i_sel = keys.index(sel[1]) if sel[1] is not None else 0
+            cnt = f"{len(rows_all)} processes" + (f" · {len(rows)} {'groups' if grouped else 'shown'}" if grouped or filt else "")
+            put(1, 1, cnt, P(5))
+            bn = banner(alert, w - 3 - (1 + len(cnt) + 3)) if alert else None
+            if bn: put(1, 1 + len(cnt) + 3, bn, hdr_pair(cols[2] if alert[1][0] == "stuck" else cols[1]) | curses.A_BOLD)
+            else:  put(1, 1 + len(cnt) + 3, "CPU / GPU / RAM per row = its share of the whole PC (CPU: 100% = all cores busy)", P(5))
+            gx = max(40, w - 24)
+            put(2, gx, f"[{'x' if grouped else ' '}] Group by name  ^G", P(6) if grouped else P(5))
+            hit_group = (gx, gx + 20)
+            put(2, 1, "Search: ", P(5))                                   # typing anywhere in this view lands here
+            if filt: put(2, 9, filt + ("█" if typing_mode else ""), P(6) | curses.A_BOLD)
+            else:    put(2, 9, "Ctrl+F to search by name or PID" if not typing_mode else "█", P(5))
+            xc, xg, xv, xr = stat_x(w)
+            xp = xc - 16                                               # PID / Count column, 8 wide
+            xl = xp + 9                                                # Load bar, 5 wide
+            arrow = "▼" if sort_desc else "▲"
+            cur = SORTS[sort_i][1]
+            hdr_attr = P(5) | curses.A_BOLD
+            put(3, 1, " " * (w - 2), hdr_attr)
+            put(3, 4, "Name" + (arrow if cur == "Name" else ""), hdr_attr)
+            put(3, xp, ((arrow if cur == "PID" else "") + ("Count" if grouped else "PID")).rjust(8), hdr_attr)
+            put(3, xl, (arrow if cur == "Load" else "") + "Load", hdr_attr)
+            draw_stat_heads(3, w, cur, arrow)
+            hit_heads += [(4, xp - 1, 3), (xp, xp + 8, 4), (xl, xl + 6, 5), (xc, xc + 6, 0), (xg, xg + 4, 2), (xv, xv + 6, 2), (xr, xr + 6, 1)]
+            body = h - 5
+            top = max(0, min(i_sel - body // 2, len(rows) - body))
+            for r, row in enumerate(rows[top: top + body]):
+                y = 4 + r
+                esta = row["key"] == sel[1]
+                hit_rows[y] = row["key"]
+                base = curses.A_BOLD if esta else 0
+                if esta: put(y, 1, " " * (w - 2), P(6, True))
+                put(y, 1, " ▸ " if esta else "   ", fg_pair(ACCENT, esta) | curses.A_BOLD)
+                nm_w = max(8, xp - 6)
+                nm = row["name"] if len(row["name"]) <= nm_w else row["name"][: nm_w - 1] + "…"
+                put(y, 4, nm, P(6, esta) | base)
+                if W.pids and W.pids & set(row["pids"]): put(y, 3, "◉", fg_pair(ACCENT, esta) | curses.A_BOLD)
+                hl = health(row["pids"])
+                if hl and 4 + len(nm) + 2 + 12 < xp - 1:
+                    put(y, 4 + len(nm) + 2, (f" ⚠ Not responding {hl[1]}s " if hl[0] == "stuck" else f" ◔ Busy {work_text(hl[1])} "), hdr_pair(cols[2] if hl[0] == "stuck" else cols[1]) | curses.A_BOLD)
+                put(y, xp, (f"×{row['n']}" if grouped else str(row["pid"])).rjust(8), P(5, esta) | base)
+                busy = max(row["cpu"], row["gpu"])                          # Load bar: its busiest resource, a full bar = a whole CPU core or a fully used GPU
+                if busy >= 1:
+                    k = max(1, min(5, int(round(min(busy, 100) / 100 * 5))))
+                    c = cols[2] if health(row["pids"]) else cols[1] if busy >= 50 else TOT
+                    put(y, xl, " " * k, hdr_pair(c)); put(y, xl + k, " " * (5 - k), hdr_pair(TRACK))
+                draw_stats(y, w, row, esta); draw_kill(y, w, esta)
+
+        else:
+            # ---- Problems: stuck / busy right now, then programs that crashed in the last 30 days (recurring ones first)
+            q = filt.lower()
+            prow = [] if ai_menu is not None else [r for r in prob_rows if not q or q in r["name"].lower()]
+            keys = [r["key"] for r in prow]
+            if sel[2] not in keys: sel[2] = keys[0] if keys else None
+            put(1, 1, "Search: ", P(5))
+            if filt: put(1, 9, filt + ("█" if typing_mode else ""), P(6) | curses.A_BOLD)
+            else:    put(1, 9, "Ctrl+F to search by program" if not typing_mode else "█", P(5))
+            if ai_menu is None:
+                ai_txt = (f"AI: {RP.LABELS.get(cur_ai, cur_ai)}  ✎ i" if cur_ai else "AI: choose one  ✎ i" if RP.installed() else "AI: none found (Fix it copies the case)")
+                if len(ai_txt) + 12 < w:
+                    put(1, w - len(ai_txt) - 2, ai_txt, P(5) if cur_ai else P(2)); hit_ai = (w - len(ai_txt) - 2, w - 2)
+            nw = max(14, min(30, w // 4)); x1 = 4 + nw + 2
+            for lab_, xx_ in (("Program", 4), ("What is wrong", x1)): put(2, xx_, lab_, P(5) | curses.A_BOLD)
+            if not prow and ai_menu is None:
+                put(4, 4, "✓ All good: nothing needs fixing." if not filt else "No matches.", fg_pair(TOT) | curses.A_BOLD)
+            for r, row in enumerate(prow[: max(1, h - 9)]):
+                y = 3 + r
+                esta = row["key"] == sel[2]
+                hit_rows[y] = row["key"]
+                base = curses.A_BOLD if esta else 0
+                if esta: put(y, 1, " " * (w - 2), P(6, True))
+                put(y, 1, " ▸ " if esta else "   ", fg_pair(ACCENT, esta) | curses.A_BOLD)
+                put(y, 4, row["name"][:nw].ljust(nw), P(6, esta) | base)
+                if row.get("watched"): put(y, 3, "◉", fg_pair(ACCENT, esta) | curses.A_BOLD)
+                put(y, x1, row["what"], P(3 if row["stuck"] else 2, esta) | base)                  # red only for a hung app
+                if esta:
+                    bx = max(x1 + len(row["what"]) + 3, w - 16)
+                    put(y, bx, " Fix it ⏎ ", hdr_pair(ACCENT) | curses.A_BOLD); hit_an[y] = (bx, bx + 11)
+            cur_ = next((r for r in prow if r["key"] == sel[2]), None)
+            if cur_:                                                         # plain-language explanation of the picked row
+                put(h - 5, 1, "─" * (w - 2), P(5))
+                words, ln_, y_ = cur_["detail"].split(), "", h - 4
+                for wd_ in words:
+                    if len(ln_) + len(wd_) + 1 > w - 4: put(y_, 2, ln_, P(6)); ln_, y_ = wd_, y_ + 1
+                    else: ln_ = (ln_ + " " + wd_).strip()
+                if y_ <= h - 2: put(y_, 2, ln_, P(6))
+
+        if view == 2 and ai_menu is not None:                                    # one-time question: which AI fixes things
+            put(4, 4, "Which AI should fix things for you?", P(6) | curses.A_BOLD)
+            put(5, 4, "Pick one. You can change it later with i.", P(5))
+            for n_, (t_, lab_) in enumerate(ai_menu["items"]):
+                y_ = 7 + n_; on_ = n_ == ai_menu["idx"]
+                if on_: put(y_, 1, " " * (w - 2), P(6, True))
+                put(y_, 1, " ▸ " if on_ else "   ", fg_pair(ACCENT, on_) | curses.A_BOLD)
+                put(y_, 4, lab_, P(6, on_) | (curses.A_BOLD if on_ else 0)); hit_menu[y_] = n_
+        if msg and now < msg_until: put(h - 1, 1, msg[: w - 2], P(2))
+        elif view == 2 and ai_menu is not None: put(h - 1, 1, "↑↓ choose · Enter: use it · Esc: later", P(5))
+        else:
+            foot = ("pick a row · x end task · Enter go · c close · w follow · a fix it · Ctrl+F search · Tab: Processes · F2 Jail · Esc quit" if view == 0 else
+                    "pick a row · x end task · w follow · a fix it · Ctrl+F search · ←→ sort by column · Tab: Apps · F2 Jail · Esc quit" if view == 1 else
+                    "Enter: fix it · w stop following · Esc: back")
+            put(h - 1, 1, foot, P(5))
+        scr.refresh()
+
+        k = scr.getch()
+        if k == -1: continue
+        if ai_menu is not None and view == 2:                                   # the AI question owns the keyboard until answered
+            pick_ = None
+            if k == curses.KEY_MOUSE:
+                try: _, mx, my, _, bs = curses.getmouse()
+                except curses.error: continue
+                if bs & curses.BUTTON1_PRESSED and my in hit_menu: ai_menu["idx"] = hit_menu[my]; pick_ = hit_menu[my]
+            elif k == curses.KEY_DOWN: ai_menu["idx"] = min(len(ai_menu["items"]) - 1, ai_menu["idx"] + 1)
+            elif k == curses.KEY_UP: ai_menu["idx"] = max(0, ai_menu["idx"] - 1)
+            elif k in (10, 13, curses.KEY_ENTER): pick_ = ai_menu["idx"]
+            elif k == 27: ai_menu = None
+            if pick_ is not None:
+                cur_ai = ai_menu["items"][pick_][0]; RP.set_ai(cur_ai); ai_menu = None
+                say(f"Done: {RP.LABELS[cur_ai]} will fix things. Change it anytime with i.", 6)
+            continue
+        if k == curses.KEY_MOUSE:
+            try: _, mx, my, _, bs = curses.getmouse()
+            except curses.error: continue
+            if WHEEL_UP and bs & WHEEL_UP: move(-3); continue
+            if WHEEL_DOWN and bs & WHEEL_DOWN: move(3); continue
+            if not bs & curses.BUTTON1_PRESSED: continue
+            if my == 0:                                                       # tabs
+                v = next((i for x0, x1, i in hit_tabs if x0 <= mx < x1), None)
+                if v is not None: view = last_main if v == 2 and view == 2 else v; armed = None
+            elif view == 1 and my == 3:                                         # column header: sort by it (again = reverse)
+                si = next((i for x0, x1, i in hit_heads if x0 <= mx < x1), None)
+                if si is not None:
+                    if si == sort_i: sort_desc = not sort_desc
+                    else: sort_i, sort_desc = si, SORTS[si][3]
+            elif view == 1 and my == 2 and hit_group and hit_group[0] <= mx < hit_group[1]:     # group checkbox
+                grouped = not grouped; sel[1] = None; picked[1] = False
+            elif view == 2 and hit_ai and my == 1 and hit_ai[0] <= mx < hit_ai[1]:
+                inst_ = RP.installed()
+                if inst_: ai_menu = dict(items=[(t_, RP.LABELS[t_]) for t_ in inst_], idx=max(0, inst_.index(cur_ai)) if cur_ai in inst_ else 0)
+            elif my in hit_dis and hit_dis[my][0] <= mx < hit_dis[my][1]:
+                picked[view] = True; dismiss_selected()
+            elif my in hit_an and hit_an[my][0] <= mx < hit_an[my][1]:
+                picked[view] = True; start_report()
+            elif my in hit_kill and hit_kill[my][0] <= mx < hit_kill[my][1]:    # red ✕ on the selected row: end task (the click is the deliberate pick)
+                picked[view] = True; act("kill")
+            elif my in hit_rows:                                                # row: select, double-click = go
+                key = hit_rows[my]
+                dbl = key == click[0] and now - click[1] < 0.5
+                if sel[view] != key: armed = None
+                sel[view] = key; click = (key, now); picked[view] = True
+                if dbl and view == 0 and act("go"): return
+                if dbl and view == 2: start_report()
+            continue
+        if k == 9:                                                 # Tab
+            view = last_main if view == 2 else 1 - view; armed = None; typing_mode = False; continue
+        if k == curses.KEY_F2:
+            view = last_main if view == 2 else 2; armed = None; typing_mode = False; continue
+        if typing_mode and (k in (10, 13, curses.KEY_ENTER) or k in (curses.KEY_DOWN, curses.KEY_UP)):
+            typing_mode = False                              # Enter / arrows: keep the filter, go back to hotkeys
+            if k in (10, 13, curses.KEY_ENTER):
+                keys_ = keys
+                if keys_ and sel[view] not in keys_: sel[view] = keys_[0]
+                picked[view] = bool(keys_); continue
+        if k == ord("w") and picked[view] and not typing_mode:
+            toggle_watch(); continue
+        if k == ord("a") and picked[view] and not typing_mode:
+            start_report(); continue
+        if k == ord("i") and view == 2 and not typing_mode:
+            inst_ = RP.installed()
+            if inst_: ai_menu = dict(items=[(t_, RP.LABELS[t_]) for t_ in inst_], idx=max(0, inst_.index(cur_ai)) if cur_ai in inst_ else 0)
+            else: say("No AI installed (claude, codex, gemini, opencode). Fix it will copy the case so you can paste it anywhere.", 8)
+            continue
+        if k == ord("d") and view == 2 and picked[2] and not typing_mode:
+            dismiss_selected(); continue
+        if k in (10, 13, curses.KEY_ENTER) and view in (1, 2):
+            start_report(); continue
+        if k == ord("x") and picked[view] and not typing_mode:   # Blender-style: x ends the picked task
+            act("kill"); continue
+        if view == 0 and k == ord("c") and picked[0] and not typing_mode:
+            act("close"); continue
+        if (k == 6 or k == ord("/")) and not typing_mode:    # Ctrl+F or '/' = search mode; outside it letters are hotkeys
+            typing_mode = True; sel[view] = None; picked[view] = False; armed = None; continue
+        if typing_mode and (32 <= k < 127 or k in (curses.KEY_BACKSPACE, 127, 8, 21)):     # typing only while searching
+            if k == 21: filt = ""
+            elif 32 <= k < 127: filt += chr(k)
+            else: filt = filt[:-1]
+            sel[view] = None; picked[view] = False; armed = None; continue
+        if k == 27:
+            if filt or typing_mode: filt = ""; typing_mode = False; sel[view] = None; picked[view] = False; continue      # first Esc clears the search
+            if view == 2: view = last_main; continue                         # Esc leaves the jail, it does not quit
+            return
+        if k == curses.KEY_DOWN: move(1); armed = None
+        elif k == curses.KEY_UP: move(-1); armed = None
+        elif k == curses.KEY_NPAGE: move(10)
+        elif k == curses.KEY_PPAGE: move(-10)
+        elif k == curses.KEY_HOME: move(-10 ** 6)
+        elif k == curses.KEY_END: move(10 ** 6)
+        elif k == 7 and view == 1: grouped = not grouped; sel[1] = None; picked[1] = False     # Ctrl+G
+        elif k == 18 and view == 1: sort_desc = not sort_desc                       # Ctrl+R
+        elif k in (curses.KEY_LEFT, curses.KEY_RIGHT) and view == 1:
+            sort_i = (sort_i + (1 if k == curses.KEY_RIGHT else -1)) % len(SORTS); sort_desc = SORTS[sort_i][3]
+        elif k in (10, 13, curses.KEY_ENTER) and view == 0:
+            if act("go"): return
+        elif k in (curses.KEY_DC, 24): act("kill")
+
+try:
+    os.write(1, b"\033]2;deathcorridor\007")
+    curses.wrapper(main)
+except BaseException:
+    import traceback
+    try:
+        d = os.path.expanduser("~/.local/state/deathcorridor"); os.makedirs(d, exist_ok=True)
+        with open(d + "/crash.log", "a") as f: f.write(time.strftime("%F %T ") + traceback.format_exc() + "\n")
+    except OSError: pass
+    traceback.print_exc()
+finally:
+    subprocess.run(["pkill", "-P", str(os.getpid()), "parec"], capture_output=True)
+    os._exit(0)

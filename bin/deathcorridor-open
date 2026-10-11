@@ -1,0 +1,19 @@
+#!/bin/bash
+# Open deathcorridor, or bring it to the front if it is already running. Always on top of other floating windows, on the current workspace.
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+find_addr() { hyprctl -j clients | jq -r '[.[] | select(.class=="TUI.float" and .title=="deathcorridor")][0].address // empty'; }
+raise() {  # $1 = address: pinned (follows you across workspaces, drawn above normal floats), focused, on top
+  local w="address:$1"
+  [[ $(hyprctl -j clients | jq -r --arg a "$1" '.[] | select(.address==$a) | .pinned') == true ]] \
+    || hyprctl dispatch "hl.dsp.window.pin({ window = \"$w\" })" >/dev/null
+  hyprctl dispatch "hl.dsp.focus({ window = \"$w\" })" >/dev/null
+  hyprctl dispatch "hl.dsp.window.bring_to_top({ window = \"$w\" })" >/dev/null
+}
+addr=$(find_addr)
+if [[ -n $addr ]]; then
+  raise "$addr"
+else
+  omarchy-launch-tui --app-id=TUI.float "$here/deathcorridor" &
+  for _ in $(seq 1 40); do sleep 0.1; addr=$(find_addr); [[ -n $addr ]] && { raise "$addr"; break; }; done
+  wait
+fi
