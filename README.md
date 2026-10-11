@@ -8,6 +8,8 @@ A Ctrl+Alt+Del for Omarchy that a new Linux user can actually use. It is a termi
 
 **Follow a program** (`w`): flag any app with `w` (it gets a `◉`). deathcorridor records when it starts, exits, crashes, hangs, hogs a CPU core or grows in memory, and keeps CPU/RAM samples. Fix it sends the AI the whole timeline; afterwards it checks the app stays healthy for 10 minutes and tells you when it is fixed (desktop notification), or brings it back if it fails again.
 
+![Apps with the live audio meter](docs/apps-meter.gif)
+
 ![Processes](docs/processes.png)
 
 ![JAIL following a program](docs/jail.png)
