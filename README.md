@@ -1,14 +1,21 @@
 # deathcorridor — a task manager for Omarchy
 
-A Ctrl+Alt+Del for Omarchy that a new Linux user can actually use. It is a terminal app (floating window) with three places:
+![Apps with the live audio meter](docs/apps-meter.gif)
+
+**Managing processes on Linux shouldn't need a manual.** deathcorridor is the Ctrl+Alt+Del that new Linux users are missing: one key opens it, you see your apps in plain language, and when something hangs or keeps crashing you press Enter and an AI explains what is wrong, asks "ok?", fixes it and puts everything back. No `kill -9`, no `htop`, no forum threads.
+
+- **Made for people who don't know the terminal:** apps grouped by workspace, one-key *end task*, protection against ending something critical by accident, and a calm JAIL view that only speaks up when something really needs attention.
+- **Looks like your desktop:** it reads the active Omarchy theme and follows it, so it matches your colors, whatever theme you use (it picks up a new theme the next time you open it).
+- **Bring your own AI:** Claude, Codex, Gemini, OpenCode or a local model. Nothing leaves your machine unless you pick a remote one.
+- **Still fast for experts:** sort, group by name, search, GPU/VRAM per process, a live audio meter per app.
+
+It is a terminal app (floating window) with three places:
 
 - **Apps** — your windows by workspace, plus apps running in the background, with live CPU / GPU / VRAM / RAM and an audio meter.
 - **Processes** — every process of yours, sortable, grouped by name, with a *Load* column that puts the thing that matters first.
 - **JAIL** (`F2`) — what needs attention: an app not responding, or one that keeps crashing. `Enter` hands the case (crash backtrace, journal, kernel warnings, recent updates, with your user/host/paths redacted) to an AI of your choice, which explains it in plain language, asks `ok?`, fixes it and puts everything back.
 
 **Follow a program** (`w`): flag any app with `w` (it gets a `◉`). deathcorridor records when it starts, exits, crashes, hangs, hogs a CPU core or grows in memory, and keeps CPU/RAM samples. Fix it sends the AI the whole timeline; afterwards it checks the app stays healthy for 10 minutes and tells you when it is fixed (desktop notification), or brings it back if it fails again.
-
-![Apps with the live audio meter](docs/apps-meter.gif)
 
 ![Processes](docs/processes.png)
 
