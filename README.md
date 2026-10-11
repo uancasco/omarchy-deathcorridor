@@ -6,7 +6,7 @@
 
 - **Made for people who don't know the terminal:** apps grouped by workspace, one-key *end task*, protection against ending something critical by accident, and a calm JAIL view that only speaks up when something really needs attention.
 - **Looks like your desktop:** it reads the active Omarchy theme and follows it, so it matches your colors, whatever theme you use (it picks up a new theme the next time you open it).
-- **Bring your own AI:** Claude, Codex, Gemini, OpenCode or a local model. Nothing leaves your machine unless you pick a remote one.
+- **Bring your own AI:** Claude, Codex, Gemini, OpenCode, or any command you configure (a local model, your own script). Nothing leaves your machine unless you pick a remote one.
 - **Still fast for experts:** sort, group by name, search, GPU/VRAM per process, a live audio meter per app.
 
 It is a terminal app (floating window) with three places:
@@ -71,7 +71,7 @@ o.window("^TUI.float$", { tag = "-default-opacity", opacity = "1 override 1 over
 
 ## The AI
 
-On first entering JAIL it asks which AI to use (only if several are installed): `claude`, `codex`, `gemini`, `opencode`, or a local model through a `jaime` command. If none is installed, Fix it copies the case to the clipboard so you can paste it anywhere. Config: `~/.config/deathcorridor/ai.conf` (also lets you set your own command). claude is started with a read-only allowlist, so the only question is the `ok?` before a real change.
+On first entering JAIL it asks which AI to use (only if several are installed): `claude`, `codex`, `gemini` or `opencode`. Any other AI, script or local model runner works through a custom command in `ai.conf` (for example `command = my-ai --prompt "$(cat {file})"`). If none is installed, Fix it copies the case to the clipboard so you can paste it anywhere. Config: `~/.config/deathcorridor/ai.conf` (also lets you set your own command). claude is started with a read-only allowlist, so the only question is the `ok?` before a real change.
 
 ## What it reads and writes
 

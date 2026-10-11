@@ -375,16 +375,15 @@ READ_ONLY = ["Bash(coredumpctl:*)", "Bash(journalctl:*)", "Bash(pacman -Q:*)", "
 PRESETS = {"claude": 'claude "$(cat "$0")" --allowedTools ' + " ".join(f'"{t}"' for t in READ_ONLY),
            "codex": 'codex "$(cat "$0")"',
            "gemini": 'gemini -i "$(cat "$0")"',
-           "opencode": 'opencode --prompt "$(cat "$0")"',
-           "local": 'jaime --tui --prompt "$(cat "$0")"'}                     # a local model: OpenCode on top of LM Studio / llama-server
+           "opencode": 'opencode --prompt "$(cat "$0")"'}
 AUTO_ORDER = ["claude", "codex", "gemini", "opencode"]                          # "auto" = the first one installed
 CONFIG = os.path.expanduser("~/.config/deathcorridor/ai.conf")
 CONFIG_TEMPLATE = """# deathcorridor: which AI looks into a problem when you press "Fix it".
 # ai = auto  -> the first one found: claude, codex, gemini, opencode
-# ai = claude | codex | gemini | opencode | local   (local = jaime --tui, your local model)
+# ai = claude | codex | gemini | opencode
 ai = auto
 
-# Anything else (a script, another CLI, a local model): write the command here. {file} is the file with the instructions and the case.
+# Anything else (a script, another CLI, a local model runner): write the command here. {file} is the file with the instructions and the case.
 # command = my-ai --prompt "$(cat {file})"
 """
 
@@ -408,12 +407,12 @@ def ensure_config():
         except OSError: pass
 
 
-LABELS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "opencode": "OpenCode", "local": "Local model (Jaime)", "custom": "Custom command"}
+LABELS = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini", "opencode": "OpenCode", "custom": "Custom command"}
 
 
 def installed():
     """The AIs this machine has, in a stable order."""
-    return [t for t in ("claude", "codex", "gemini", "opencode", "local") if shutil.which(PRESETS[t].split()[0])]
+    return [t for t in ("claude", "codex", "gemini", "opencode") if shutil.which(PRESETS[t].split()[0])]
 
 
 def chosen():
